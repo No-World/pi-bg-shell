@@ -1,0 +1,54 @@
+{
+	"name": "pi-bg-shell",
+	"version": "0.1.0",
+	"description": "Background shell tasks for the Pi coding agent: start non-blocking commands with bash_bg and get woken with the output when they exit, Claude Code style.",
+	"type": "module",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/No-World/pi-bg-shell.git"
+	},
+	"keywords": [
+		"pi-package",
+		"pi",
+		"pi-coding-agent",
+		"pi-extension",
+		"bash",
+		"background",
+		"shell"
+	],
+	"license": "MIT",
+	"files": [
+		"extensions/",
+		"README.md",
+		"README.zh-CN.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"test": "node --test tests/*.test.ts && node scripts/check-docs.mjs",
+		"typecheck": "tsc --noEmit",
+		"check:docs": "node scripts/check-docs.mjs"
+	},
+	"pi": {
+		"extensions": [
+			"./extensions/bg-shell/index.ts"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": ">=0.80"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-coding-agent": {
+			"optional": true
+		}
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@types/node": "^22.0.0",
+		"typebox": "*",
+		"typescript": "^5.5.0"
+	},
+	"bugs": {
+		"url": "https://github.com/No-World/pi-bg-shell/issues"
+	},
+	"homepage": "https://github.com/No-World/pi-bg-shell#readme"
+}

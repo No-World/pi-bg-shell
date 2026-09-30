@@ -1,0 +1,67 @@
+# pi-bg-shell
+
+[Pi 编码 agent](https://github.com/earendil-works/pi) 的后台 shell 任务扩展——Claude Code 式体验：启动命令、继续干活、命令退出时输出自动送回。
+
+```
+你:      跑一下测试套件，趁这个时间顺便起草 changelog
+Agent:   bash_bg  →  Started background task #1 (pid 4242): npm test
+Agent:   （继续写 changelog、回你消息、读文件……）
+通知:    Background task #1 completed (exit 0, 42.1s): npm test
+         --- stdout tail (1234/5678 bytes) ---
+         ……
+```
+
+## 为什么需要它
+
+Pi 内置的 `bash` 工具会阻塞整个 agent 轮次直到命令结束——两分钟的测试套件就是两分钟的会话冻结。`pi-bg-shell` 给 agent 三个工具，把长命令（构建、测试套件、dev server、文件监听）丢到后台，**命令一退出就自动唤醒** agent 并送上输出——不轮询、不蹲守。
+
+## 工具
+
+| 工具 | 作用 |
+|------|------|
+| `bash_bg` | 用 `bash -c` 后台执行命令，立即返回任务 id。每流 1 MiB 尾部缓冲捕获输出；超出即把全量历史溢写到文件。 |
+| `bg_status` | 列出全部任务的单行摘要，或按 id 取单个任务的完整状态与输出尾部。 |
+| `bg_kill` | 按 id 终止任务（默认 `SIGTERM`）。 |
+
+完成通知以 `bg-shell-notify` 消息经 `pi.sendMessage({ triggerTurn: true })` 送进对话——与官方 file-trigger 示例、pi-subagents 的完成通知同一条唤醒原语。100 ms 窗口内的并发完成合并为一条消息，fan-out 不会冲垮会话。默认墙钟上限每任务 10 分钟（`timeout_sec` 可覆盖；`0` 关闭）。
+
+## 安装
+
+```bash
+pi install git:github.com/No-World/pi-bg-shell
+```
+
+本地开发：
+
+```bash
+git clone https://github.com/No-World/pi-bg-shell
+pi --extension /path/to/pi-bg-shell/extensions/bg-shell/index.ts
+```
+
+`/reload` 与会话切换保留运行中的任务；退出 pi 时 SIGTERM+SIGKILL 全部子进程并清理溢写文件。
+
+## 唤醒机制
+
+1. `bash_bg` 拉起子进程；工具结果瞬间返回。
+2. 退出时注册表经 `onExit` 钩子发出最终快照。
+3. debounce 窗口（100 ms）把并发完成合并成一条消息。
+4. notifier 调 `pi.sendMessage(..., { triggerTurn: true })`——空闲会话直接开新一轮 agent 运行；busy 会话由 pi 排队。
+5. agent 读到输出尾部（及全量输出的溢写文件路径），继续干活。
+
+任务注册表挂在 `globalThis`（`Symbol.for` 键）上，跨扩展 reload 存活；入口工厂每次加载重绑 exit 钩子，reload 后的完成照样到达 agent。设计权衡记录在 [docs/adrs/0003-background-shell-wake-mechanism.md](docs/adrs/0003-background-shell-wake-mechanism.md)。
+
+## 开发
+
+```bash
+npm install
+npm test             # node:test 套件 + 机械文档门禁
+npm run typecheck    # 严格 TypeScript 检查
+npm run check:docs   # 单独跑文档门禁
+pi --extension .     # 交互式体验
+```
+
+仓库带完整工程 harness：带机械索引门禁的 ADR（[docs/adrs/README.md](docs/adrs/README.md)）、坑位手册（[docs/PITFALLS.md](docs/PITFALLS.md)）、postmortem 闭环模板（[docs/postmortems/README.md](docs/postmortems/README.md)）、术语表（[CONTEXT.md](CONTEXT.md)），以及与本地门禁同清单的 CI lane（[.github/workflows/pr-checks.yml](.github/workflows/pr-checks.yml)）。贡献规则见 [AGENTS.md](AGENTS.md)。
+
+## 许可
+
+[MIT](LICENSE)
