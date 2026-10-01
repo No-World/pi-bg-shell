@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { OutputBuffer, TaskRegistry } from "../extensions/bg-shell/tasks.ts";
+
+function tempDir(prefix: string): string {
+	return mkdtempSync(join(tmpdir(), `pi-bg-shell-test-${prefix}-`));
+}
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5000, stepMs = 10): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -16,7 +22,7 @@ function freshRegistry(overrides: Partial<ConstructorParameters<typeof TaskRegis
 }
 
 test("OutputBuffer keeps everything under the limit and never spills", () => {
-	const buffer = new OutputBuffer(1024, "/tmp/should-not-exist-unittest.log");
+	const buffer = new OutputBuffer(1024, join(tempDir("nospill"), "never.log"));
 	buffer.append(Buffer.from("hello "));
 	buffer.append(Buffer.from("world"));
 	assert.equal(buffer.byteLength, 11);
@@ -26,13 +32,36 @@ test("OutputBuffer keeps everything under the limit and never spills", () => {
 });
 
 test("OutputBuffer spills full history on first overflow and keeps the tail in memory", () => {
-	const buffer = new OutputBuffer(8, "/tmp/pi-bg-shell-test-spill.log");
+	const dir = tempDir("spill");
+	const spillPath = join(dir, "out.log");
+	const buffer = new OutputBuffer(8, spillPath);
 	buffer.append(Buffer.from("0123456789")); // already over the limit → spill
 	assert.equal(buffer.truncated, true);
-	assert.equal(buffer.spillPath, "/tmp/pi-bg-shell-test-spill.log");
+	assert.equal(buffer.spillPath, spillPath);
 	assert.equal(buffer.byteLength, 10);
 	// Memory keeps only the tail once the spill exists.
 	assert.equal(buffer.tail(4), "6789");
+	// Spill file is owner-only (0600), matching the CodeQL hardening.
+	const mode = statSync(spillPath).mode & 0o777;
+	assert.equal(mode, 0o600);
+	// dispose is idempotent and removes the file.
+	buffer.dispose();
+	buffer.dispose();
+	assert.ok(!existsSync(spillPath));
+});
+
+test("OutputBuffer falls back to bounded lossy memory when the spill path is taken", () => {
+	const dir = tempDir("lossy");
+	const spillPath = join(dir, "out.log");
+	writeFileSync(spillPath, "leftover from a crashed run"); // wx must refuse this
+	const buffer = new OutputBuffer(8, spillPath);
+	for (let i = 0; i < 100; i++) buffer.append(Buffer.from("0123456789"));
+	assert.equal(buffer.truncated, true); // lossy, not spilled
+	assert.equal(buffer.spillPath, undefined);
+	assert.equal(buffer.byteLength, 1000);
+	// Bounded memory: tail stays near the limit instead of growing unbounded.
+	assert.ok(buffer.tail(1000).length <= 32);
+	buffer.dispose();
 });
 
 test("start returns a running snapshot and completes with exit 0", async () => {
