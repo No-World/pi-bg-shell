@@ -61,11 +61,19 @@ On Windows, `bash` is typically the WSL relay and inherited Windows file handles
 
 ## User surface
 
-While tasks run, a one-line status widget sits above the editor (the fleet-style bar):
+While tasks run, a card-style status widget sits above the input editor and repaints every 500 ms — elapsed times tick, spinners rotate, and each card shows the original command plus the task's current output and volume:
 
 ```
-▶ bg 2 running: #1 npm test (1m12s) · #2 vite dev (0m31s) — /bg panel
+bg · background
+   ⠸ #1 chatty-ticker · running · 1m 12s
+     cmd: for i in $(seq 150); do echo …
+     ⎿  ↓ 18.0k · [16:52:31] chatty heartbeat #93 …
+   ⠋ #2 quiet-soak · running · 4m 2s
+     cmd: sleep 300
+ 2 running · /bg panel
 ```
+
+The header and task labels render plain; chrome (`· running ·`, `cmd:`, `⎿`) is dim, stats are muted, and commands plus live output lines use the toolOutput color. Every line is truncated to the terminal width. More than six running tasks collapse into `… +N more`; the widget (and its ticker) removes itself when the last task ends.
 
 All information views open an overlay panel — never dump into the transcript:
 
