@@ -61,17 +61,19 @@ Windows 上 `bash` 通常是 WSL 中继，继承的 Windows 文件句柄跨不�
 
 ## 用户界面
 
-任务运行期间，编辑器下方常驻 fleet 风格状态窗，每 500ms 重绘——计时逐秒在走、每任务一个旋转 spinner，输出正在增长的任务带 `⎿ ↓ +N` 活动行：
+任务运行期间，输入框上方常驻卡片式状态窗，每 500ms 重绘——计时逐秒在走、spinner 轮换，每张卡片带原始命令与当前输出（增长时附 `(＋N)` 增量）：
 
 ```
-▶ bg · background
- ├─ ⠋ #1 npm test · 1m 12s
- │    ⎿ ↓ +2.1k
- └─ ⠸ #2 vite dev · 31s
+bg · background
+   ⠸ #1 chatty-ticker · running · 1m 12s
+     cmd: for i in $(seq 150); do echo …
+     ⎿  ↓ 18.0k (+2.1k) · [16:52:31] chatty heartbeat #93 …
+   ⠋ #2 quiet-soak · running · 4m 2s
+     cmd: sleep 300
  2 running · /bg panel
 ```
 
-运行中任务超过六个折叠为 `… +N more`；最后一个任务结束后 widget 连同 ticker 一起消失。
+分区主题着色（表头/标签 accent、装饰 dim、统计 muted、增量 success、命令与实时行 toolOutput），每行按终端宽度截断。运行中任务超过六个折叠为 `… +N more`；最后一个任务结束后 widget 连同 ticker 一起消失。
 
 所有查看类指令一律拉起弹窗面板，不往正文窗口灌内容：
 

@@ -26,7 +26,10 @@ export default function (pi: ExtensionAPI) {
 	const notifier = new CompletionNotifier({
 		sendMessage: (message, options) => pi.sendMessage(message, options),
 	});
-	const statusBar = new BgStatusBar();
+	const statusBar = new BgStatusBar({
+		// Per-tick output facts for the activity line: bytes + last output line.
+		getOutput: (id) => registry.output(id, 512),
+	});
 
 	// Rebind on every load: after /reload this is a fresh runtime, while the
 	// registry (and its children) keep running from the previous one —

@@ -5,9 +5,29 @@ import {
 	BgStatusBar,
 	formatElapsed,
 	formatStatusBarLines,
+	truncateStyled,
+	type StatusTheme,
+	type TaskActivity,
+	type WidgetComponent,
 	type WidgetTimer,
 } from "../extensions/bg-shell/status-bar.ts";
 import type { TaskSnapshot } from "../extensions/bg-shell/tasks.ts";
+
+/** Identity theme — plain-text assertions; roles recorded for color tests. */
+function plainTheme(): StatusTheme & { roles: string[] } {
+	const roles: string[] = [];
+	return {
+		roles,
+		fg: (role, text) => {
+			roles.push(role);
+			return text;
+		},
+	};
+}
+
+function activity(overrides: Partial<TaskActivity> = {}): TaskActivity {
+	return { deltaBytes: 0, lastLine: "", ...overrides };
+}
 
 function snapshot(overrides: Partial<TaskSnapshot> = {}): TaskSnapshot {
 	return {
@@ -38,6 +58,8 @@ function snapshot(overrides: Partial<TaskSnapshot> = {}): TaskSnapshot {
 	};
 }
 
+const WIDE = 200;
+
 /** Recording fake timer — tests fire ticks by hand and observe start/stop. */
 class FakeTimer implements WidgetTimer {
 	setCalls = 0;
@@ -57,6 +79,35 @@ class FakeTimer implements WidgetTimer {
 	}
 }
 
+/** Factory-form fake ui: captures registrations, hands back fake tui + theme. */
+class FakeUi {
+	setCalls: { key: string; kind: "factory" | "undefined" | "lines"; placement?: string }[] = [];
+	renders = 0;
+	requests = 0;
+	theme = plainTheme();
+	component: WidgetComponent | undefined;
+	setWidget: (key: string, content: unknown, options?: { placement?: string }) => void = (key, content, options) => {
+		if (content === undefined) {
+			this.setCalls.push({ key, kind: "undefined" });
+			this.component = undefined;
+			return;
+		}
+		if (typeof content === "function") {
+			this.setCalls.push({ key, kind: "factory", placement: options?.placement });
+			this.component = content(
+				{ requestRender: () => (this.requests += 1) },
+				this.theme as StatusTheme,
+			);
+			return;
+		}
+		this.setCalls.push({ key, kind: "lines" });
+	};
+	render(width = WIDE): string[] {
+		this.renders += 1;
+		return this.component?.render(width) ?? [];
+	}
+}
+
 test("formatElapsed matches the subagent-fleet spacing", () => {
 	assert.equal(formatElapsed(45), "45s");
 	assert.equal(formatElapsed(65), "1m 5s");
@@ -64,151 +115,251 @@ test("formatElapsed matches the subagent-fleet spacing", () => {
 });
 
 test("formatStatusBarLines is undefined with no running tasks", () => {
-	assert.equal(formatStatusBarLines([], Date.now()), undefined);
-	assert.equal(formatStatusBarLines([snapshot({ status: "completed" })], Date.now()), undefined);
+	const theme = plainTheme();
+	assert.equal(formatStatusBarLines({ running: [], now: Date.now(), tick: 0, activity: new Map() }, theme, WIDE), undefined);
+	assert.equal(
+		formatStatusBarLines(
+			{ running: [snapshot({ status: "completed" })], now: Date.now(), tick: 0, activity: new Map() },
+			theme,
+			WIDE,
+		),
+		undefined,
+	);
 });
 
-test("formatStatusBarLines renders header, tree row, and footer", () => {
-	const now = Date.now();
-	const lines = formatStatusBarLines([snapshot()], now);
+test("formatStatusBarLines renders the card layout: header, row, cmd, footer", () => {
+	const theme = plainTheme();
+	const lines = formatStatusBarLines(
+		{ running: [snapshot()], now: Date.now(), tick: 0, activity: new Map() },
+		theme,
+		WIDE,
+	);
 	assert.ok(lines !== undefined);
-	assert.equal(lines[0], "▶ bg · background");
-	assert.match(lines[1] ?? "", /└─ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] #1 npm test · 1m 5s/);
+	assert.equal(lines[0], "bg · background");
+	assert.match(lines[1] ?? "", /^   [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] #1 npm test · running · 1m 5s$/);
+	assert.equal(lines[2], "     cmd: npm test");
 	assert.equal(lines.at(-1), " 1 running · /bg panel");
+	// No output yet → no ⎿ activity line.
+	assert.ok(!lines.some((line) => line.includes("⎿")));
 });
 
 test("formatStatusBarLines ignores finished snapshots mixed with running ones", () => {
+	const theme = plainTheme();
 	const lines = formatStatusBarLines(
-		[snapshot({ status: "completed" }), snapshot({ id: 2, status: "running", label: "vite dev" })],
-		Date.now(),
+		{
+			running: [snapshot({ status: "completed" }), snapshot({ id: 2, label: "vite dev" })].filter(
+				(task) => task.status === "running",
+			),
+			now: Date.now(),
+			tick: 0,
+			activity: new Map(),
+		},
+		theme,
+		WIDE,
 	);
 	assert.ok(lines !== undefined);
 	assert.equal(lines.filter((line) => line.includes("#")).length, 1);
 	assert.match(lines[1] ?? "", /#2 vite dev/);
-	assert.match(lines.at(-1) ?? "", /1 running/);
-});
-
-test("formatStatusBarLines uses ├── between rows and └─ on the last", () => {
-	const lines = formatStatusBarLines(
-		[snapshot(), snapshot({ id: 2, label: "vite dev", startedAt: Date.now() - 31_000 })],
-		Date.now(),
-	);
-	assert.ok(lines !== undefined);
-	assert.match(lines[1] ?? "", / ├─ /);
-	assert.match(lines[2] ?? "", / └─ /);
 });
 
 test("formatStatusBarLines rotates the spinner with the tick phase", () => {
-	const now = Date.now();
-	const first = formatStatusBarLines([snapshot()], now, { tick: 0 });
-	const second = formatStatusBarLines([snapshot()], now, { tick: 1 });
+	const theme = plainTheme();
+	const state = (tick: number) => ({
+		running: [snapshot()],
+		now: Date.now(),
+		tick,
+		activity: new Map<number, TaskActivity>(),
+	});
+	const first = formatStatusBarLines(state(0), theme, WIDE);
+	const second = formatStatusBarLines(state(1), theme, WIDE);
 	assert.ok(first !== undefined && second !== undefined);
 	assert.notEqual(first[1], second[1]);
 });
 
-test("formatStatusBarLines adds an activity subline under tasks with fresh output", () => {
-	const lines = formatStatusBarLines([snapshot()], Date.now(), {
-		activity: new Map([[1, 2150]]),
-	});
-	assert.ok(lines !== undefined);
-	assert.match(lines[2] ?? "", /^ +⎿ ↓ \+2\.1k$/);
-	// Subline follows the tree continuation of its parent row (└─ → blank).
-	assert.match(lines[2] ?? "", /^ /);
-});
-
-test("formatStatusBarLines activity subline keeps the │ rail under a ├── row", () => {
+test("formatStatusBarLines adds a ⎿ activity line with delta and last output", () => {
+	const theme = plainTheme();
 	const lines = formatStatusBarLines(
-		[snapshot(), snapshot({ id: 2, label: "vite dev" })],
-		Date.now(),
-		{ activity: new Map([[1, 512]]) },
+		{
+			running: [snapshot({ stdoutBytes: 18_400, stderrBytes: 0 })],
+			now: Date.now(),
+			tick: 0,
+			activity: new Map([[1, activity({ deltaBytes: 2150, lastLine: "[00:19:48] chatty heartbeat #112" })]]),
+		},
+		theme,
+		WIDE,
 	);
 	assert.ok(lines !== undefined);
-	assert.match(lines[2] ?? "", /^ │    ⎿ ↓ \+512 B$/);
+	const subline = lines.find((line) => line.includes("⎿"));
+	assert.ok(subline !== undefined);
+	assert.match(subline, /↓ 18\.0k/);
+	assert.match(subline, /\(\+2\.1k\)/);
+	assert.match(subline, /chatty heartbeat #112/);
 });
 
 test("formatStatusBarLines collapses fan-outs beyond six tasks", () => {
-	const now = Date.now();
+	const theme = plainTheme();
 	const running = [1, 2, 3, 4, 5, 6, 7].map((id) => snapshot({ id, label: `job${id}` }));
-	const lines = formatStatusBarLines(running, now);
+	const lines = formatStatusBarLines({ running, now: Date.now(), tick: 0, activity: new Map() }, theme, WIDE);
 	assert.ok(lines !== undefined);
-	assert.match(lines.at(-2) ?? "", / └─ … \+1 more/);
+	assert.ok(lines.some((line) => line.includes("… +1 more")));
 	assert.ok(!lines.some((line) => line.includes("job7")));
 	assert.match(lines.at(-1) ?? "", / 7 running/);
 });
 
-test("BgStatusBar starts ticking on first running task and paints below the editor", () => {
-	const timer = new FakeTimer();
-	const calls: { key: string; content: string[] | undefined; placement?: string }[] = [];
-	const bar = new BgStatusBar({ timer });
-	bar.bindUi({
-		setWidget: (key, content, options) => calls.push({ key, content, placement: options?.placement }),
-	});
-	assert.equal(timer.setCalls, 0);
-	bar.refresh([snapshot()]);
-	assert.equal(timer.setCalls, 1);
-	assert.equal(calls.at(-1)?.key, BG_STATUS_WIDGET_KEY);
-	assert.equal(calls.at(-1)?.placement, "belowEditor");
-	const painted = calls.at(-1)?.content?.[1] ?? "";
-	timer.fire();
-	assert.equal(calls.length, 3); // bind-clear, refresh-paint, tick-paint
-	assert.notEqual(calls.at(-1)?.content?.[1] ?? "", painted); // spinner advanced
+test("truncateStyled cuts plain text with an ellipsis and respects width", () => {
+	assert.equal(truncateStyled("hello world", 8), "hello w…");
+	assert.equal(truncateStyled("short", 40), "short");
+	assert.equal(truncateStyled("中文宽度测试", 5), "中文…"); // CJK counts double
 });
 
-test("BgStatusBar stops the ticker when the running set empties", () => {
+test("truncateStyled keeps ANSI colors before the cut and resets after", () => {
+	const styled = `\x1b[31m${"a".repeat(20)}\x1b[0m`;
+	const cut = truncateStyled(styled, 10);
+	assert.ok(cut.startsWith("\x1b[31m"));
+	assert.ok(cut.endsWith("…\x1b[0m"));
+	assert.ok(!cut.slice(0, -2).includes("\x1b[0m"));
+});
+
+test("formatStatusBarLines never exceeds the requested width", () => {
+	const theme = plainTheme();
+	const lines = formatStatusBarLines(
+		{
+			running: [snapshot({ label: "a-very-long-label".repeat(4), command: `echo ${"x".repeat(120)}` })],
+			now: Date.now(),
+			tick: 0,
+			activity: new Map([[1, activity({ deltaBytes: 9, lastLine: "y".repeat(120) })]]),
+		},
+		theme,
+		40,
+	);
+	assert.ok(lines !== undefined);
+	for (const line of lines) {
+		const bare = line.replace(/\x1b\[[0-9;]*m/g, "");
+		assert.ok(bare.length <= 40, `line too long: ${bare.length}`);
+	}
+});
+
+test("formatStatusBarLines colors roles per section", () => {
+	const theme = plainTheme();
+	formatStatusBarLines(
+		{
+			running: [snapshot()],
+			now: Date.now(),
+			tick: 0,
+			activity: new Map([[1, activity({ deltaBytes: 512, lastLine: "boom" })]]),
+		},
+		theme,
+		WIDE,
+	);
+	assert.ok(theme.roles.includes("accent"));
+	assert.ok(theme.roles.includes("dim"));
+	assert.ok(theme.roles.includes("muted"));
+	assert.ok(theme.roles.includes("success"));
+	assert.ok(theme.roles.includes("toolOutput"));
+});
+
+test("BgStatusBar registers a factory widget above the editor and ticks it", () => {
 	const timer = new FakeTimer();
-	const calls: { content: string[] | undefined }[] = [];
+	const ui = new FakeUi();
 	const bar = new BgStatusBar({ timer });
-	bar.bindUi({ setWidget: (_key, content) => calls.push({ content }) });
+	bar.bindUi(ui);
+	assert.equal(ui.setCalls.length, 0); // nothing running: no registration
+	bar.refresh([snapshot()]);
+	const registration = ui.setCalls.at(-1);
+	assert.equal(registration?.key, BG_STATUS_WIDGET_KEY);
+	assert.equal(registration?.kind, "factory");
+	assert.equal(registration?.placement, "aboveEditor");
+	assert.ok(ui.component !== undefined);
+	const first = ui.render();
+	assert.match(first[1] ?? "", /#1 npm test/);
+	const spinnerBefore = first[1];
+	timer.fire();
+	assert.equal(ui.requests, 2); // refresh-sync + tick-sync both asked pi to repaint
+	const second = ui.render();
+	assert.notEqual(second[1], spinnerBefore); // spinner advanced
+});
+
+test("BgStatusBar feeds output tails into the activity line", () => {
+	const timer = new FakeTimer();
+	const ui = new FakeUi();
+	let bytes = 1000;
+	let tail = "[00:19:48] chatty heartbeat #112 ······ payload bytes flowing\n";
+	const bar = new BgStatusBar({
+		timer,
+		getOutput: (id) =>
+			id === 1
+				? { stdoutTail: tail, stderrTail: "", stdoutBytes: bytes, stderrBytes: 0 }
+				: undefined,
+	});
+	bar.bindUi(ui);
+	bar.refresh([snapshot()]);
+	let lines = ui.render();
+	assert.ok(lines.some((line) => line.includes("chatty heartbeat #112")));
+	assert.ok(!lines.some((line) => line.includes("(+"))); // first paint: baseline only, no delta
+	bytes = 3150;
+	tail += "[00:19:50] chatty heartbeat #113 ······ payload bytes flowing\n";
+	timer.fire();
+	lines = ui.render();
+	const subline = lines.find((line) => line.includes("⎿"));
+	assert.ok(subline !== undefined);
+	assert.match(subline, /\(\+2\.1k\)/);
+	assert.match(subline, /heartbeat #113/); // last line advanced
+});
+
+test("BgStatusBar removes the widget and stops the ticker when tasks drain", () => {
+	const timer = new FakeTimer();
+	const ui = new FakeUi();
+	const bar = new BgStatusBar({ timer });
+	bar.bindUi(ui);
 	bar.refresh([snapshot()]);
 	bar.refresh([snapshot({ status: "completed", finishedAt: Date.now(), durationMs: 100 })]);
+	assert.equal(ui.setCalls.at(-1)?.kind, "undefined");
 	assert.equal(timer.clearCalls, 1);
-	assert.equal(calls.at(-1)?.content, undefined); // widget removed
 });
 
 test("BgStatusBar stops the ticker when the UI unbinds", () => {
 	const timer = new FakeTimer();
+	const ui = new FakeUi();
 	const bar = new BgStatusBar({ timer });
-	bar.bindUi({ setWidget: () => undefined });
+	bar.bindUi(ui);
 	bar.refresh([snapshot()]);
 	bar.bindUi(undefined);
 	assert.equal(timer.clearCalls, 1);
 });
 
-test("BgStatusBar surfaces grown output as an activity subline on the next tick", () => {
+test("BgStatusBar re-registers on a fresh UI surface after a rebind", () => {
 	const timer = new FakeTimer();
-	const calls: string[][] = [];
+	const first = new FakeUi();
 	const bar = new BgStatusBar({ timer });
-	bar.bindUi({
-		setWidget: (_key, content) => {
-			if (content) calls.push(content);
-		},
-	});
-	bar.refresh([snapshot({ stdoutBytes: 1000 })]);
-	assert.ok(!calls.at(-1)?.some((line) => line.includes("⎿"))); // no baseline yet
-	bar.refresh([snapshot({ stdoutBytes: 3150 })]); // grew 2150 since last paint
-	assert.ok(calls.at(-1)?.some((line) => line.includes("⎿ ↓ +2.1k")));
+	bar.bindUi(first);
+	bar.refresh([snapshot()]);
+	assert.equal(first.setCalls.filter((call) => call.kind === "factory").length, 1);
+	const second = new FakeUi();
+	bar.bindUi(second); // reload: new surface, same running set
+	second.render();
+	assert.equal(second.setCalls.filter((call) => call.kind === "factory").length, 1);
+	assert.match(second.render()[1] ?? "", /#1 npm test/);
 });
 
 test("BgStatusBar without a UI remembers running tasks for a late bind", () => {
 	const timer = new FakeTimer();
-	const calls: { content: string[] | undefined }[] = [];
 	const bar = new BgStatusBar({ timer });
 	bar.refresh([snapshot()]);
-	assert.equal(calls.length, 0); // headless: no crash, no paint
-	assert.equal(timer.setCalls, 0); // and no ticker against a dead surface
-	bar.bindUi({ setWidget: (_key, content) => calls.push({ content }) });
-	assert.equal(calls.length, 1);
-	assert.match(calls[0].content?.[1] ?? "", /#1 npm test/);
+	assert.equal(timer.setCalls, 0); // headless: no ticker against a dead surface
+	const ui = new FakeUi();
+	bar.bindUi(ui);
+	assert.equal(ui.setCalls.filter((call) => call.kind === "factory").length, 1);
+	assert.match(ui.render()[1] ?? "", /#1 npm test/);
 	assert.equal(timer.setCalls, 1); // late bind starts the ticker
 });
 
 test("BgStatusBar.clear removes the widget and stops the ticker", () => {
 	const timer = new FakeTimer();
-	const calls: { content: string[] | undefined }[] = [];
+	const ui = new FakeUi();
 	const bar = new BgStatusBar({ timer });
-	bar.bindUi({ setWidget: (_key, content) => calls.push({ content }) });
+	bar.bindUi(ui);
 	bar.refresh([snapshot()]);
 	bar.clear();
-	assert.equal(calls.at(-1)?.content, undefined);
+	assert.equal(ui.setCalls.at(-1)?.kind, "undefined");
 	assert.equal(timer.clearCalls, 1);
 });
