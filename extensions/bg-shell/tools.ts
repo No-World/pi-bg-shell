@@ -38,6 +38,8 @@ const BgKillParams = Type.Object({
 
 export interface BgToolDeps {
 	registry: TaskRegistry;
+	/** Called after state changes (task started / killed) so the host can refresh UI. */
+	onChange?: () => void;
 }
 
 /** Models sometimes emit "#3" or "3" for an id field; normalize before validation. */
@@ -103,6 +105,7 @@ export function bashBgTool(deps: BgToolDeps) {
 		promptGuidelines: [
 			"Prefer bash_bg over bash for any command expected to take longer than a few seconds (builds, test suites, dev servers, watches).",
 			"bash_bg returns immediately; results arrive as a bg-shell-notify completion message — never poll in a loop, just continue other work.",
+			"Progress checks and terminations go through bg_status and bg_kill, not ps/grep/kill via bash.",
 		],
 		parameters: BashBgParams,
 		executionMode: "sequential" as const,
@@ -120,9 +123,11 @@ export function bashBgTool(deps: BgToolDeps) {
 				env: params.env,
 				label: params.label,
 			});
+			deps.onChange?.();
 			const text =
 				`Started background task #${snapshot.id} (pid ${snapshot.pid ?? "?"}): ${snapshot.label}\n` +
-				`A completion notification with the output arrives automatically on exit — continue working; do not poll.`;
+				`A completion notification with the output arrives automatically on exit — continue working; do not poll.\n` +
+				`On-demand checks: bg_status {"id": ${snapshot.id}} for progress, bg_kill {"id": ${snapshot.id}} to stop it.`;
 			return {
 				content: [{ type: "text" as const, text }],
 				details: { id: snapshot.id, pid: snapshot.pid, command: snapshot.command, timeoutMs: snapshot.timeoutMs },
@@ -136,8 +141,16 @@ export function bgStatusTool(deps: BgToolDeps) {
 		name: "bg_status",
 		label: "Background task status",
 		description:
-			"List background shell tasks (running and recently finished) with one-line summaries, " +
-			"or fetch one task's full status and output tails by id. Use this to check on a task the completion message referred to.",
+			"Source of truth for background tasks started with bash_bg: list tasks with one-line summaries, " +
+			"or fetch one task's live status and output tails by id. The in-memory buffers and the id↔pid mapping " +
+			"are visible only here — ps/grep/tail through bash cannot find task ids or un-spilled output. " +
+			"Use it whenever a bg-shell-notify completion message arrives or progress is needed.",
+		promptSnippet:
+			"bg_status — inspect background tasks (live output tails, ids, statuses); the registry is the source of truth, not ps/grep/tail",
+		promptGuidelines: [
+			"Background tasks started with bash_bg live in an in-memory registry: check them with bg_status, never by piping ps/grep/tail through bash — task ids and live buffers are invisible to bash.",
+			"When a bg-shell-notify message truncates output or you need a task's current progress, call bg_status with the id from the #N header (e.g. id: 3).",
+		],
 		parameters: BgStatusParams,
 		executionMode: "sequential" as const,
 		prepareArguments: coerceNumericId,
@@ -187,6 +200,10 @@ export function bgKillTool(deps: BgToolDeps) {
 		label: "Kill background task",
 		description:
 			"Terminate a background shell task by id (default SIGTERM). Use for dev servers or watches that no longer need to run.",
+		promptSnippet: "bg_kill — terminate a background task by id (id from bash_bg or a #N header)",
+		promptGuidelines: [
+			"Stop background tasks with bg_kill rather than kill/pkill through bash: the registry then reports the task as killed instead of failed.",
+		],
 		parameters: BgKillParams,
 		executionMode: "sequential" as const,
 		prepareArguments: coerceNumericId,
@@ -206,6 +223,7 @@ export function bgKillTool(deps: BgToolDeps) {
 				};
 			}
 			deps.registry.kill(params.id, params.signal ?? "SIGTERM");
+			deps.onChange?.();
 			return {
 				content: [{ type: "text" as const, text: `Sent ${params.signal ?? "SIGTERM"} to task #${params.id} (${existing.label}).` }],
 				details: { id: params.id, signal: params.signal ?? "SIGTERM", killed: true },

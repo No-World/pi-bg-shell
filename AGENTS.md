@@ -2,7 +2,7 @@
 
 ## Project Layout
 
-- `extensions/bg-shell/` contains the TypeScript extension source (`tasks.ts` registry core, `notify.ts` completion notifier, `tools.ts` model-facing tools, `index.ts` entry).
+- `extensions/bg-shell/` contains the TypeScript extension source (`tasks.ts` registry core, `notify.ts` completion notifier, `tools.ts` model-facing tools, `command.ts` the `/bg` command family, `panel.ts` the overlay panel component, `status-bar.ts` the persistent status widget, `index.ts` entry).
 - `tests/` contains the `node:test` test files.
 - `scripts/` contains repo-level checks (`check-docs.mjs`).
 - `docs/` holds decision records, pitfalls, and postmortems; `CONTEXT.md` is the domain glossary.

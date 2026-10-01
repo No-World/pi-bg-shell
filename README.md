@@ -25,6 +25,26 @@ Pi's built-in `bash` tool blocks the whole agent turn until the command finishes
 
 Completion is delivered as a `bg-shell-notify` message via `pi.sendMessage({ triggerTurn: true })` — the same wake primitive the official file-trigger example and pi-subagents' completion path use. Completions inside a 100 ms window merge into a single message, so a fan-out of tasks cannot stampede the session. Default wall-clock limit is 10 minutes per task (`timeout_sec` overrides; `0` disables).
 
+## User surface
+
+While tasks run, a one-line status widget sits above the editor (the fleet-style bar):
+
+```
+▶ bg 2 running: #1 npm test (1m12s) · #2 vite dev (0m31s) — /bg panel
+```
+
+All information views open an overlay panel — never dump into the transcript:
+
+| Command | What opens |
+|---------|------------|
+| `/bg` | Overlay panel: task list, `↑↓` select, `Enter` detail, `K` kill, `r` refresh, `q` close |
+| `/bg <id>` | The panel focused on one task's detail (status, exit code, command, output tails, spill path) |
+| `/bg tail <id> [bytes]` | Same detail view with a larger output tail (default 4096 bytes) |
+| `/bg log <id>` | Same detail view; truncated tasks show their full-output spill path |
+| `/bg kill <id> [signal]` | Terminates a task (default `SIGTERM`) with a toast ack |
+
+Tab-completion offers subcommands and task ids. Headless modes (RPC/JSON/print) degrade to notify summaries.
+
 ## Install
 
 ```bash

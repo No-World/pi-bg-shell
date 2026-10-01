@@ -75,6 +75,29 @@ test("a single completion sends one message with triggerTurn", async () => {
 	assert.deepEqual(captured.optionsList[0], { triggerTurn: true });
 });
 
+test("completion messages carry a bg_status follow-up hint with a concrete id", async () => {
+	const captured: Captured = { messages: [], optionsList: [] };
+	const notifier = new CompletionNotifier({ sendMessage: capturingSend(captured), debounceMs: 5 });
+	notifier.push(snapshot({ id: 9 }), output());
+	await sleep(40);
+	assert.match(captured.messages[0].content, /bg_status \{"id": 9\} fetches more output/);
+});
+
+test("the follow-up hint survives output truncation", async () => {
+	const captured: Captured = { messages: [], optionsList: [] };
+	const notifier = new CompletionNotifier({
+		sendMessage: capturingSend(captured),
+		debounceMs: 5,
+		maxContentChars: 120,
+		maxTaskOutputChars: 80,
+	});
+	notifier.push(snapshot({ id: 4 }), output({ stdoutTail: "x".repeat(2000) }));
+	await sleep(40);
+	const content = captured.messages[0].content;
+	assert.match(content, /content truncated/);
+	assert.match(content, /bg_status \{"id": 4\}/);
+});
+
 test("running snapshots are ignored", async () => {
 	const captured: Captured = { messages: [], optionsList: [] };
 	const notifier = new CompletionNotifier({ sendMessage: capturingSend(captured), debounceMs: 10 });
