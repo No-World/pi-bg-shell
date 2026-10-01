@@ -996,7 +996,7 @@ export class TaskRegistry {
 				stdoutPath: manifest.stdoutPath,
 				stderrPath: manifest.stderrPath,
 				statusPath: manifest.statusPath,
-				manifestFd: undefined, // adopted: updates reopen with "r+"
+				manifestFd: undefined, // adopted: manifests are never rewritten in-session; fired state persists via the .fired marker
 			},
 			adopted: true,
 			fileOffsets: { stdout: statSize(manifest.stdoutPath), stderr: statSize(manifest.stderrPath) },
