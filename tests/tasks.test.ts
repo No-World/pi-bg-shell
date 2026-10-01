@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { defaultTimeoutMsFromEnv, LineMatcher, OutputBuffer, TaskRegistry, type RunningEvent, type TaskOutput, type TaskSnapshot } from "../extensions/bg-shell/tasks.ts";
+import { buildWslDetachedWrapper, defaultTimeoutMsFromEnv, LineMatcher, OutputBuffer, TaskRegistry, toWslPath, type RunningEvent, type TaskOutput, type TaskSnapshot } from "../extensions/bg-shell/tasks.ts";
 
 function tempDir(prefix: string): string {
 	return mkdtempSync(join(tmpdir(), `pi-bg-shell-test-${prefix}-`));
@@ -402,6 +402,35 @@ test("a pattern that fired while nobody watched is delivered once on adoption", 
 	await waitFor(() => second.status(id)[0].status !== "running");
 	first.dispose();
 	second.dispose();
+});
+
+test("toWslPath translates Windows drive paths and rejects the rest", () => {
+	assert.equal(toWslPath("C:\\Users\\a\\b.log"), "/mnt/c/Users/a/b.log");
+	assert.equal(toWslPath("d:/x/y z"), "/mnt/d/x/y z");
+	assert.equal(toWslPath("\\\\server\\\\share\\\\x"), undefined, "UNC shares are untranslatable");
+	assert.equal(toWslPath("/tmp/x"), undefined, "POSIX paths are not Windows paths");
+	assert.equal(toWslPath("C:"), undefined, "drive without a path part");
+});
+
+test("buildWslDetachedWrapper shell-redirects all three artifacts", () => {
+	const wrapped = buildWslDetachedWrapper("echo hi", {
+		stdoutPath: "/mnt/c/t/o.log",
+		stderrPath: "/mnt/c/t/e.log",
+		statusPath: "/mnt/c/t/.exit",
+	});
+	assert.equal(
+		wrapped,
+		"( echo hi\n) >> '/mnt/c/t/o.log' 2>> '/mnt/c/t/e.log'\nprintf '%s\\n' \"$?\" > '/mnt/c/t/.exit'",
+	);
+});
+
+test("buildWslDetachedWrapper single-quotes hostile path characters", () => {
+	const wrapped = buildWslDetachedWrapper("true", {
+		stdoutPath: "/mnt/c/a'b",
+		stderrPath: "/mnt/c/e",
+		statusPath: "/mnt/c/s",
+	});
+	assert.ok(wrapped.includes("'/mnt/c/a'\\''b'"), "embedded quote is escaped posix-style");
 });
 
 test("defaultTimeoutMsFromEnv parses PI_BG_SHELL_TIMEOUT_SEC with safe fallbacks", () => {

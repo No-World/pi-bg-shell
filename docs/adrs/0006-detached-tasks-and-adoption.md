@@ -16,7 +16,7 @@ ADR-0003 挂账的「detached 孤儿模式 + 跨会话 reattach」在反馈轮�
 
 `bash_bg { detach: true }` 走独立 spawn 路径（ADR-0006 语义）：
 
-1. **spawn**：`spawn("bash", ["-c", wrapped], { detached: true, stdio: ["ignore", outFd, errFd] })` + `unref()`。stdio 直写 tmpdir 下 `pi-bg-shell/` 目录里的 0600 文件（该目录 0700）——文件本身就是全量输出，天然跨会话。
+1. **spawn**：`spawn("bash", ["-c", wrapped], { detached: true, stdio: ["ignore", outFd, errFd] })` + `unref()`。stdio 直写 tmpdir 下 `pi-bg-shell/` 目录里的 0600 文件（该目录 0700）——文件本身就是全量输出，天然跨会话。**Windows+WSL 增补（2026-10-01，#15）**：WSL bash.exe 不翻译继承的 Windows 文件句柄、也无法寻址 `C:\…` 路径，fd 直写在 win32 上改走 shell 自重定向——路径经 `toWslPath` 译为 `/mnt/<drive>/…`，wrapped 变为 `( cmd ) >> OUT 2>> ERR; printf … > STATUS`，stdio 全 ignore；退出码与领养语义不变。不可翻译的路径（UNC 等）在创建任何工件前 fail-fast。POSIX 维持 fd 方案。
 2. **真实退出码**：wrapped = `( <command>\n)\nprintf '%s\n' "$?" > statusPath`。包装 bash 自身恒以 0 退出，业务码由 printf 落盘；本会话用 close 事件判死、状态文件取码，被领养任务用轮询。
 3. **清单（manifest）**：每任务一个 JSON（pid、command、cwd、startedAt、hostname、三个文件路径、pattern 的 literal/all/**fired**），与输出文件同层。文件不直放固定根目录：每个注册表实例在固定根下 `mkdtempSync` 一个会话子目录，任务文件全在里面——mkdtemp 目录下的路径是 CodeQL 认可的可信血缘（与溢写文件同模式），固定根仍可跨会话发现。根目录创建时校验属主（预存在目录必须是本 uid 的真实目录，否则拒绝）。quit 对运行中的脱离任务**不杀不清**——清单与输出文件留给下个会话。
 4. **领养**：`session_start` 时 `adoptDetached()` 扫描根目录下各会话子目录里的清单；hostname 不符跳过；pid 死亡（DOA）则静默登记终态（用状态文件恢复退出码，**不唤醒**）；活着则注册为 running 任务，2 s 轮询做死亡检测 + 增量喂 `LineMatcher`（on_pattern 跨会话续效）。single-shot 模式唤醒过一次即把 `fired: true` 持久化回清单；领养时回放历史输出——若「从未投递且已命中」则补发一次陈旧唤醒，若早已投递过则只恢复计数不重复吵。
@@ -33,5 +33,5 @@ ADR-0003 挂账的「detached 孤儿模式 + 跨会话 reattach」在反馈轮�
 ## Consequences
 
 - 正面：24h runner 不再绑定会话生死；输出/退出码/模式监视全部跨会话续传；机器重启后清单残留会被下次启动的 DOA 路径静默清理。
-- 负面/接受：**关机仍会杀任务**（明确边界）；PID 复用在「进程死、状态文件未写、pid 被复用」的窗口内可能误判存活（状态文件是权威死讯，窗口 ≤ 轮询间隔）；同一清单被两个并存 pi 会话同时领养会双份跟踪（单机单会话为主流，未做互斥）；wrapped 的 `( … )` 在命令尾部带 `#` 注释时会被注释吞掉右括号（罕见，症状是退出码缺失）；POSIX only（setsid、kill(-pid)、bash）；空会话子目录会残留（无害，OS tmp 清理兜底）。
+- 负面/接受：**关机仍会杀任务**（明确边界）；PID 复用在「进程死、状态文件未写、pid 被复用」的窗口内可能误判存活（状态文件是权威死讯，窗口 ≤ 轮询间隔）；同一清单被两个并存 pi 会话同时领养会双份跟踪（单机单会话为主流，未做互斥）；wrapped 的 `( … )` 在命令尾部带 `#` 注释时会被注释吞掉右括号（罕见，症状是退出码缺失）；win32 输出/退出码已由 shell 自重定向支持（#15），但 setsid/`kill(-pid)` 进程组语义仍 POSIX only——Windows 上脱离任务的组杀依赖 WSL 默认行为，未验证；空会话子目录会残留（无害，OS tmp 清理兜底）。
 - 后续候选：`bg_attach` 显式认领、清单互斥锁、输出文件轮转。

@@ -334,6 +334,35 @@ function shellSingleQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+/**
+ * Translate a Windows drive path for a WSL-side shell ("C:\\a\\b" →
+ * "/mnt/c/a/b"). Returns undefined for anything that is not a drive path
+ * (UNC shares, POSIX paths) — callers must fail fast instead of handing
+ * bash a path it cannot address (#15).
+ */
+export function toWslPath(path: string): string | undefined {
+	const match = /^([A-Za-z]):[\\/](.*)$/.exec(path);
+	if (match === null) return undefined;
+	return `/mnt/${match[1].toLowerCase()}/${match[2].replace(/\\/g, "/")}`;
+}
+
+/**
+ * Windows+WSL detached wrapper: WSL does not translate inherited Windows
+ * file handles (an fd passed to spawn lands on the console), so the shell
+ * itself redirects to /mnt/<drive>/ paths and stdio stays ignored. POSIX
+ * keeps the fd fast path (ADR-0006).
+ */
+export function buildWslDetachedWrapper(
+	command: string,
+	redirects: { stdoutPath: string; stderrPath: string; statusPath: string },
+): string {
+	return (
+		`( ${command}\n) >> ${shellSingleQuote(redirects.stdoutPath)}` +
+		` 2>> ${shellSingleQuote(redirects.stderrPath)}` +
+		`\nprintf '%s\\n' "$?" > ${shellSingleQuote(redirects.statusPath)}`
+	);
+}
+
 function statSize(path: string): number {
 	try {
 		return statSync(path).size;
@@ -634,12 +663,25 @@ export class TaskRegistry {
 					? { literal: params.pattern.literal, all: params.pattern.all ?? false, fired: false }
 					: undefined,
 			};
-			outFd = openSync(stdoutPath, "wx", 0o600);
-			try {
-				errFd = openSync(stderrPath, "wx", 0o600);
-			} catch (error) {
-				closeSync(outFd);
-				throw error;
+			if (process.platform === "win32") {
+				// WSL bash.exe cannot address Windows paths; fail fast before any
+				// artifact exists rather than run a task whose output and exit
+				// status can never be recorded (#15).
+				for (const path of [stdoutPath, stderrPath, statusPath]) {
+					if (toWslPath(path) === undefined) {
+						throw new Error(
+							`detached on Windows needs drive-letter paths for WSL translation (got ${path})`,
+						);
+					}
+				}
+			} else {
+				outFd = openSync(stdoutPath, "wx", 0o600);
+				try {
+					errFd = openSync(stderrPath, "wx", 0o600);
+				} catch (error) {
+					closeSync(outFd);
+					throw error;
+				}
 			}
 			// Exclusive creation ("wx") + 0600: predictable tmpdir names are only
 			// safe when creation refuses to follow pre-existing files/symlinks —
@@ -695,7 +737,22 @@ export class TaskRegistry {
 
 		let child: ChildProcess;
 		try {
-			if (detach && detachedPaths && outFd !== undefined && errFd !== undefined) {
+			if (detach && detachedPaths && process.platform === "win32") {
+				// Paths were validated as translatable before any artifact was
+				// created, so the assertions are structural only.
+				child = spawnFn(
+					"bash",
+					[
+						"-c",
+						buildWslDetachedWrapper(command, {
+							stdoutPath: toWslPath(detachedPaths.stdoutPath) as string,
+							stderrPath: toWslPath(detachedPaths.stderrPath) as string,
+							statusPath: toWslPath(detachedPaths.statusPath) as string,
+						}),
+					],
+					{ cwd, env, detached: true, stdio: "ignore" },
+				);
+			} else if (detach && detachedPaths && outFd !== undefined && errFd !== undefined) {
 				// The wrapper records the command's real exit code — the wrapper
 				// bash itself always exits 0 after its printf (ADR-0006).
 				const wrapped =

@@ -57,6 +57,8 @@ Notify:  Background task #1 pattern match (on_pattern "ROOTED", match #1, runnin
 
 `bg_kill` signals the detached task's whole process group.
 
+On Windows, `bash` is typically the WSL relay and inherited Windows file handles cannot cross that boundary — detached tasks there switch to shell-side redirection (`( cmd ) >> OUT 2>> ERR` with `/mnt/<drive>/…`-translated paths), so output files and exit codes still land exactly where `bg_status` and re-adoption expect them.
+
 ## User surface
 
 While tasks run, a one-line status widget sits above the editor (the fleet-style bar):
