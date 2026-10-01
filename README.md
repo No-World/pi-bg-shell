@@ -57,7 +57,7 @@ Notify:  Background task #1 pattern match (on_pattern "ROOTED", match #1, runnin
 
 `bg_kill` signals the detached task's whole process group.
 
-On Windows, `bash` is typically the WSL relay and inherited Windows file handles cannot cross that boundary — detached tasks there switch to shell-side redirection (`( cmd ) >> OUT 2>> ERR` with `/mnt/<drive>/…`-translated paths), so output files and exit codes still land exactly where `bg_status` and re-adoption expect them.
+On Windows, `bash` is typically the WSL relay and inherited Windows file handles cannot cross that boundary — detached tasks there switch to shell-side redirection (`( cmd ) >> OUT 2>> ERR` with `/mnt/<drive>/…`-translated paths), so output files and exit codes still land exactly where `bg_status` and re-adoption expect them. The wrapper itself ships as a host-side script file (`bash <file>`, never `-c` argv) so the recorded exit code survives the relay's argument re-quoting, and the relay is spawned with `windowsHide` so no console window pops up. `on_pattern` watches an owned detached task's output from byte zero — early startup milestones wake the session just like adopted ones (which replay history).
 
 ## User surface
 

@@ -303,6 +303,8 @@ export interface DetachedManifest {
 	stdoutPath: string;
 	stderrPath: string;
 	statusPath: string;
+	/** Windows+WSL only: host-written wrapper script — keeps "$?" out of argv (PITFALLS P6). */
+	wrapperPath?: string;
 	pattern: { literal: string; all: boolean; fired: boolean } | undefined;
 }
 
@@ -351,6 +353,11 @@ export function toWslPath(path: string): string | undefined {
  * file handles (an fd passed to spawn lands on the console), so the shell
  * itself redirects to /mnt/<drive>/ paths and stdio stays ignored. POSIX
  * keeps the fd fast path (ADR-0006).
+ *
+ * The returned string is written to a host-side script file and spawned as
+ * `bash <file>` — never as `-c` argv: the WSL relay re-quotes arguments
+ * through its default shell, which expands the double-quoted "$?" to a
+ * literal 0 before the wrapper bash even parses it (PITFALLS P6).
  */
 export function buildWslDetachedWrapper(
 	command: string,
@@ -415,6 +422,9 @@ function readManifest(path: string): DetachedManifest | undefined {
 			typeof manifest.stderrPath !== "string" ||
 			typeof manifest.statusPath !== "string"
 		) {
+			return undefined;
+		}
+		if (manifest.wrapperPath !== undefined && typeof manifest.wrapperPath !== "string") {
 			return undefined;
 		}
 		if (
@@ -536,6 +546,8 @@ interface TaskInternal {
 		stdoutPath: string;
 		stderrPath: string;
 		statusPath: string;
+		/** Windows+WSL: wrapper script; removed together with the manifest. */
+		wrapperPath?: string;
 		/** Held-open fd for owned detached tasks; manifest updates go through it (exclusively created, 0600). */
 		manifestFd: number | undefined;
 	} | undefined;
@@ -647,6 +659,7 @@ export class TaskRegistry {
 			const stdoutPath = join(ddir, `${token}.stdout.log`);
 			const stderrPath = join(ddir, `${token}.stderr.log`);
 			const statusPath = join(ddir, `${token}.exit`);
+			const wrapperPath = join(ddir, `${token}.wrapper.sh`);
 			const manifestPath = join(ddir, `${token}.json`);
 			manifest = {
 				version: 1,
@@ -667,13 +680,31 @@ export class TaskRegistry {
 				// WSL bash.exe cannot address Windows paths; fail fast before any
 				// artifact exists rather than run a task whose output and exit
 				// status can never be recorded (#15).
-				for (const path of [stdoutPath, stderrPath, statusPath]) {
+				for (const path of [stdoutPath, stderrPath, statusPath, wrapperPath]) {
 					if (toWslPath(path) === undefined) {
 						throw new Error(
 							`detached on Windows needs drive-letter paths for WSL translation (got ${path})`,
 						);
 					}
 				}
+				// The wrapper must cross the WSL boundary as a FILE, never as -c
+				// argv: the relay re-quotes arguments through its default shell,
+				// which expands the double-quoted "$?" to a literal 0 before the
+				// wrapper bash even parses it (PITFALLS P6).
+				const wrapperFd = openSync(wrapperPath, "wx", 0o600);
+				try {
+					writeSync(
+						wrapperFd,
+						buildWslDetachedWrapper(command, {
+							stdoutPath: toWslPath(stdoutPath) as string,
+							stderrPath: toWslPath(stderrPath) as string,
+							statusPath: toWslPath(statusPath) as string,
+						}),
+					);
+				} finally {
+					closeSync(wrapperFd);
+				}
+				manifest.wrapperPath = wrapperPath;
 			} else {
 				outFd = openSync(stdoutPath, "wx", 0o600);
 				try {
@@ -689,7 +720,14 @@ export class TaskRegistry {
 			// js/insecure-temporary-file). Updates go through the held-open fd.
 			const manifestFd = openSync(manifestPath, "wx", 0o600);
 			writeSync(manifestFd, JSON.stringify(manifest, null, "\t"));
-			detachedPaths = { manifestPath, stdoutPath, stderrPath, statusPath, manifestFd };
+			detachedPaths = {
+				manifestPath,
+				stdoutPath,
+				stderrPath,
+				statusPath,
+				wrapperPath: manifest.wrapperPath,
+				manifestFd,
+			};
 		}
 
 		const task: TaskInternal = {
@@ -727,7 +765,11 @@ export class TaskRegistry {
 			patternCtl: undefined,
 			detachedPaths: detach ? detachedPaths : undefined,
 			adopted: false,
-			fileOffsets: undefined,
+			// Owned detached tasks watch their output files from byte 0: POSIX
+			// files are exclusively created empty, Windows ones do not exist
+			// until the relay child starts. Lazy init at the first poll would
+			// permanently skip anything written before that tick (PITFALLS P7).
+			fileOffsets: detach ? { stdout: 0, stderr: 0 } : undefined,
 			killedByUser: false,
 			timedOut: false,
 			finalized: false,
@@ -739,19 +781,18 @@ export class TaskRegistry {
 		try {
 			if (detach && detachedPaths && process.platform === "win32") {
 				// Paths were validated as translatable before any artifact was
-				// created, so the assertions are structural only.
-				child = spawnFn(
-					"bash",
-					[
-						"-c",
-						buildWslDetachedWrapper(command, {
-							stdoutPath: toWslPath(detachedPaths.stdoutPath) as string,
-							stderrPath: toWslPath(detachedPaths.stderrPath) as string,
-							statusPath: toWslPath(detachedPaths.statusPath) as string,
-						}),
-					],
-					{ cwd, env, detached: true, stdio: "ignore" },
-				);
+				// created, and the wrapper file was written in that same block, so
+				// the assertion is structural only. argv carries a single path —
+				// no shell metacharacters cross the relay (PITFALLS P6).
+				// windowsHide: detached console apps otherwise get their own
+				// console window, so the WSL relay would pop one up.
+				child = spawnFn("bash", [toWslPath(detachedPaths.wrapperPath as string) as string], {
+					cwd,
+					env,
+					detached: true,
+					stdio: "ignore",
+					windowsHide: true,
+				});
 			} else if (detach && detachedPaths && outFd !== undefined && errFd !== undefined) {
 				// The wrapper records the command's real exit code — the wrapper
 				// bash itself always exits 0 after its printf (ADR-0006).
@@ -1053,6 +1094,7 @@ export class TaskRegistry {
 				stdoutPath: manifest.stdoutPath,
 				stderrPath: manifest.stderrPath,
 				statusPath: manifest.statusPath,
+				wrapperPath: manifest.wrapperPath,
 				manifestFd: undefined, // adopted: manifests are never rewritten in-session; fired state persists via the .fired marker
 			},
 			adopted: true,
@@ -1149,6 +1191,9 @@ export class TaskRegistry {
 		try {
 			rmSync(task.detachedPaths.manifestPath, { force: true });
 			rmSync(firedMarkerPath(task.detachedPaths.manifestPath), { force: true });
+			if (task.detachedPaths.wrapperPath !== undefined) {
+				rmSync(task.detachedPaths.wrapperPath, { force: true });
+			}
 		} catch {
 			// Best effort only.
 		}

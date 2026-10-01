@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import type { ChildProcess, spawn as spawnType } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { buildWslDetachedWrapper, defaultTimeoutMsFromEnv, LineMatcher, OutputBuffer, TaskRegistry, toWslPath, type RunningEvent, type TaskOutput, type TaskSnapshot } from "../extensions/bg-shell/tasks.ts";
 
@@ -31,7 +32,7 @@ test("OutputBuffer keeps everything under the limit and never spills", () => {
 	assert.equal(buffer.spillPath, undefined);
 });
 
-test("OutputBuffer spills full history on first overflow and keeps the tail in memory", () => {
+test("OutputBuffer spills full history on first overflow and keeps the tail in memory", { skip: "NTFS does not honor POSIX mode bits (Windows-node only)" }, () => {
 	const dir = tempDir("spill");
 	const spillPath = join(dir, "out.log");
 	const buffer = new OutputBuffer(8, spillPath);
@@ -304,13 +305,78 @@ test("detached tasks record their real exit code from the status file", async ()
 	registry.dispose();
 });
 
+test("detached on_pattern fires for output written before the first poll", async () => {
+	// Regression (PITFALLS P7): the file offset used to be initialized
+	// lazily at the first poll tick, permanently skipping anything written
+	// before it — the startup milestone, often the only early match, never
+	// woke the owning session. Owned detached tasks must feed from byte 0.
+	const registry = freshRegistry({ adoptPollMs: 600, detachedDirPath: tempDir("det early-pattern") });
+	const events: RunningEvent[] = [];
+	registry.onRunningEvent = (_snapshot, _output, event) => events.push(event);
+	const snapshot = registry.start({
+		command: "echo HIT; sleep 3",
+		timeoutMs: 0,
+		detach: true,
+		pattern: { literal: "HIT" },
+	});
+	await waitFor(() => events.some((event) => event.kind === "pattern"), 15_000, 20);
+	assert.equal(events[0]?.line, "HIT");
+	await waitFor(() => registry.status(snapshot.id)[0].status !== "running", 15_000, 20);
+	registry.dispose();
+});
+
+test("win32 detached spawns a host-written wrapper script, not -c argv", { skip: process.platform !== "win32" }, () => {
+	// Regression (PITFALLS P6): the wrapper used to travel as `bash -c <argv>`;
+	// the WSL relay re-quotes arguments through its default shell, expanding
+	// the double-quoted "$?" to a literal 0 — every detached exit code read 0.
+	const dir = tempDir("det wrapper-file");
+	let args: string[] | undefined;
+	let opts: Record<string, unknown> | undefined;
+	const fakeChild = {
+		pid: 4242,
+		unref: (): void => {},
+		on: (): unknown => fakeChild,
+	};
+	const fakeSpawn = ((_cmd: string, argv: string[], options: object) => {
+		args = argv;
+		opts = options as Record<string, unknown>;
+		return fakeChild;
+	}) as unknown as typeof spawnType;
+	const registry = freshRegistry({ detachedDirPath: dir, spawnFn: fakeSpawn });
+	registry.start({ command: "exit 42", detach: true, timeoutMs: 0 });
+	assert.ok(args !== undefined, "spawn was called");
+	assert.equal(args.length, 1, "argv is only the wrapper path — no -c string, no $?");
+	const wslPath = args[0] as string;
+	assert.match(wslPath, /^\/mnt\/[a-z]\//, "path is WSL-translated");
+	assert.ok(!wslPath.includes("$"), "no shell metacharacters cross the relay argv");
+	assert.equal(opts?.detached, true);
+	assert.equal(opts?.stdio, "ignore");
+	assert.equal(opts?.windowsHide, true, "the relay console must stay hidden");
+	// The wrapper content lives in a host-side file (0600, exclusive)…
+	const drive = /^\/mnt\/([a-z])\/(.*)$/.exec(wslPath);
+	assert.ok(drive !== null);
+	const wrapperPath = `${drive[1]!.toUpperCase()}:\\${drive[2]!.replace(/\//g, "\\")}`;
+	const wrapper = readFileSync(wrapperPath, "utf8");
+	assert.ok(wrapper.includes(`printf '%s\\n' "$?"`), "the exit-code printf survives only inside the file");
+	assert.ok(wrapper.includes("( exit 42"));
+	// …and the manifest records it so adoption-side cleanup can remove it.
+	const manifestName = readdirSync(dirname(wrapperPath)).find((name) => name.endsWith(".json"));
+	assert.ok(manifestName !== undefined);
+	const manifest = JSON.parse(readFileSync(join(dirname(wrapperPath), manifestName), "utf8"));
+	assert.equal(manifest.wrapperPath, wrapperPath);
+	registry.dispose();
+});
+
 test("detached tasks survive dispose (quit) and are re-adopted by a fresh session", async () => {
 	const shared = tempDir("det adopt");
 	const first = freshRegistry({ detachedDirPath: shared });
 	const snapshot = first.start({ command: "echo booting; sleep 2", detach: true });
 	const pid = snapshot.pid;
 	assert.ok(pid !== undefined);
-	await new Promise((resolve) => setTimeout(resolve, 300)); // let the wrapper spawn + echo flush
+	// Let the wrapper spawn and flush its first output before quitting: the
+	// WSL relay needs ~400ms to boot, so a blind 300ms sleep races it and the
+	// adoption would inspect an output file that does not exist yet.
+	await waitFor(() => (first.output(snapshot.id)?.stdoutTail ?? "") !== "", 5000);
 	first.dispose(); // quit: detached survivors keep running, files stay
 	const second = freshRegistry({ adoptPollMs: 50, detachedDirPath: shared });
 	assert.equal(second.adoptDetached(), 1);
@@ -346,7 +412,7 @@ test("detached tasks that died before adoption register their outcome silently",
 	second.dispose();
 });
 
-test("killing a detached task signals the process group", async () => {
+test("killing a detached task signals the process group", { skip: "process-group kill is POSIX-only on Windows+WSL (ADR-0006 known gap)" }, async () => {
 	const registry = freshRegistry({ detachedDirPath: tempDir("det kill") });
 	const snapshot = registry.start({ command: "sleep 30", detach: true });
 	registry.kill(snapshot.id, "SIGTERM");
