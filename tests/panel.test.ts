@@ -194,6 +194,29 @@ test("panel reflects finished task duration and exit code", async () => {
 	registry.dispose();
 });
 
+test("panel shows the timeout budget on running rows and in detail", async () => {
+	const registry = new TaskRegistry({ killGraceMs: 100 });
+	registry.start({ command: "sleep 30", label: "budgeted", timeoutMs: 600_000 });
+	const component = panel(registry);
+	assert.match(component.render(100).join("\n"), /running \d+s \/ 10m/);
+	component.handleInput("\r");
+	assert.match(component.render(120).join("\n"), /timeout: 10m · .* left/);
+	registry.dispose();
+});
+
+test("panel detail says timeout: none when unlimited and drops the line once finished", async () => {
+	const registry = new TaskRegistry({ killGraceMs: 100 });
+	registry.start({ command: "sleep 30", timeoutMs: 0 });
+	const component = panel(registry);
+	component.handleInput("\r");
+	assert.match(component.render(120).join("\n"), /timeout: none/);
+	registry.kill(1, "SIGKILL");
+	await waitFor(() => registry.status(1)[0].status !== "running");
+	component.refresh();
+	assert.ok(!component.render(120).join("\n").includes("timeout:"));
+	registry.dispose();
+});
+
 test("TaskSnapshot list from registry.status is panel input shape", () => {
 	const registry = new TaskRegistry({ killGraceMs: 100 });
 	registry.start({ command: "echo s", timeoutMs: 0 });

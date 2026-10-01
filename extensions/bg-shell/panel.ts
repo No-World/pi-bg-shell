@@ -13,7 +13,7 @@
  */
 
 import type { TaskOutput, TaskRegistry, TaskSnapshot } from "./tasks.ts";
-import { formatShort } from "./status-bar.ts";
+import { formatBudget, formatShort } from "./status-bar.ts";
 
 export interface PanelTheme {
 	fg(role: never, text: string): string;
@@ -205,7 +205,9 @@ export class BgPanelComponent {
 			const marker = index === this.selected ? "▸ " : "  ";
 			const time =
 				task.status === "running"
-					? `running ${formatShort(Math.max(0, Math.floor((now - task.startedAt) / 1000)))}`
+					? `running ${formatShort(Math.max(0, Math.floor((now - task.startedAt) / 1000)))}${
+						task.timeoutMs > 0 ? ` / ${formatBudget(task.timeoutMs)}` : ""
+					}`
 					: `${task.status}${task.exitCode !== null ? ` exit ${task.exitCode}` : ""} in ${formatShort(
 							Math.floor((task.durationMs ?? 0) / 1000),
 						)}`;
@@ -241,6 +243,17 @@ export class BgPanelComponent {
 		}
 		if (task.reportEveryMs !== undefined && task.status === "running") {
 			lines.push(theme.fg("muted" as never, ` report every ${Math.round(task.reportEveryMs / 1000)}s`));
+		}
+		if (task.status === "running") {
+			const left = Math.max(0, task.timeoutMs - (this.now() - task.startedAt));
+			lines.push(
+				theme.fg(
+					"muted" as never,
+					task.timeoutMs > 0
+						? ` timeout: ${formatBudget(task.timeoutMs)} · ${formatBudget(left)} left`
+						: " timeout: none",
+				),
+			);
 		}
 		if (task.errorMessage !== undefined) {
 			lines.push(theme.fg("error" as never, ` error: ${task.errorMessage}`));

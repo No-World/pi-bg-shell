@@ -3,6 +3,7 @@ import test from "node:test";
 import {
 	BG_STATUS_WIDGET_KEY,
 	BgStatusBar,
+	formatBudget,
 	formatElapsed,
 	formatStatusBarLines,
 	truncateStyled,
@@ -114,6 +115,33 @@ test("formatElapsed matches the subagent-fleet spacing", () => {
 	assert.equal(formatElapsed(3725), "1h 2m 5s");
 });
 
+test("formatBudget trims zero units at every scale", () => {
+	assert.equal(formatBudget(0), "0s");
+	assert.equal(formatBudget(45_000), "45s");
+	assert.equal(formatBudget(59_999), "59s");
+	assert.equal(formatBudget(300_000), "5m");
+	assert.equal(formatBudget(270_000), "4m 30s");
+	assert.equal(formatBudget(7_200_000), "2h");
+	assert.equal(formatBudget(7_500_000), "2h 5m");
+});
+
+test("formatStatusBarLines appends the timeout budget only when one is armed", () => {
+	const theme = plainTheme();
+	const armed = formatStatusBarLines(
+		{ running: [snapshot()], now: Date.now(), tick: 0, activity: new Map() },
+		theme,
+		WIDE,
+	);
+	assert.match(armed?.[1] ?? "", /1m 5s \/ 10m$/);
+	const unlimited = formatStatusBarLines(
+		{ running: [snapshot({ timeoutMs: 0 })], now: Date.now(), tick: 0, activity: new Map() },
+		theme,
+		WIDE,
+	);
+	assert.match(unlimited?.[1] ?? "", /1m 5s$/);
+	assert.ok(!(unlimited?.[1] ?? "").includes("/"));
+});
+
 test("formatStatusBarLines is undefined with no running tasks", () => {
 	const theme = plainTheme();
 	assert.equal(formatStatusBarLines({ running: [], now: Date.now(), tick: 0, activity: new Map() }, theme, WIDE), undefined);
@@ -136,7 +164,7 @@ test("formatStatusBarLines renders the card layout: header, row, cmd, footer", (
 	);
 	assert.ok(lines !== undefined);
 	assert.equal(lines[0], "bg · background");
-	assert.match(lines[1] ?? "", /^   [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] #1 npm test · running · 1m 5s$/);
+	assert.match(lines[1] ?? "", /^   [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] #1 npm test · running · 1m 5s \/ 10m$/);
 	assert.equal(lines[2], "     cmd: npm test");
 	assert.equal(lines.at(-1), " 1 running · /bg panel");
 	// No output yet → no ⎿ activity line.
