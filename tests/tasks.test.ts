@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import type { ChildProcess, spawn as spawnType } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { buildWslDetachedWrapper, defaultTimeoutMsFromEnv, LineMatcher, OutputBuffer, TaskRegistry, toWslPath, type RunningEvent, type TaskOutput, type TaskSnapshot } from "../extensions/bg-shell/tasks.ts";
@@ -86,7 +86,9 @@ test("non-zero exit marks the task failed and captures stderr", async () => {
 	const finished = registry.status(snapshot.id)[0];
 	assert.equal(finished.status, "failed");
 	assert.equal(finished.exitCode, 3);
-	assert.equal(registry.output(snapshot.id)?.stderrTail.trim(), "oops");
+	// includes, not equals: the WSL relay may prepend environment noise to
+	// stderr (e.g. the localhost-proxy warning when a system proxy is set).
+	assert.ok(registry.output(snapshot.id)?.stderrTail.includes("oops"));
 	registry.dispose();
 });
 
@@ -468,6 +470,98 @@ test("a pattern that fired while nobody watched is delivered once on adoption", 
 	await waitFor(() => second.status(id)[0].status !== "running");
 	first.dispose();
 	second.dispose();
+});
+
+test("every spawn we own hides its console on Windows (relay never pops a window)", () => {
+	let opts: Record<string, unknown> | undefined;
+	const fakeChild = {
+		pid: 4242,
+		unref: (): void => {},
+		on: (): unknown => fakeChild,
+	};
+	const fakeSpawn = ((_cmd: string, _argv: string[], options: object) => {
+		opts = options as Record<string, unknown>;
+		return fakeChild;
+	}) as unknown as typeof spawnType;
+	const registry = freshRegistry({ spawnFn: fakeSpawn });
+	registry.start({ command: "true", timeoutMs: 0 });
+	assert.equal(opts?.windowsHide, true, "non-detached spawns must be hidden too");
+	registry.dispose();
+});
+
+test("manifests owned by a live foreign process are not adopted", async () => {
+	// Pool isolation (ADR-0006): a live foreign owner's manifest is invisible —
+	// not adopted, not reaped, not listed. The "foreign pi process" here is any
+	// pid that is alive and not ours.
+	const shared = tempDir("det foreign-owner");
+	const registry = freshRegistry({ detachedDirPath: shared });
+	const holder = registry.start({ command: "sleep 30", timeoutMs: 0 });
+	await waitFor(() => registry.status(holder.id)[0].status === "running");
+	const dir = join(shared, "s-forged");
+	mkdirSync(dir, { recursive: true });
+	const manifestPath = join(dir, "forged.json");
+	writeFileSync(
+		manifestPath,
+		JSON.stringify({
+			version: 1,
+			pid: holder.pid,
+			command: "sleep 30",
+			label: "foreign",
+			cwd: process.cwd(),
+			startedAt: Date.now(),
+			hostname: hostname(),
+			stdoutPath: join(dir, "o.log"),
+			stderrPath: join(dir, "e.log"),
+			statusPath: join(dir, ".exit"),
+			ownerPid: holder.pid,
+		}),
+	);
+	assert.equal(registry.adoptDetached(), 0, "live foreign owner — pool stays private");
+	assert.equal(
+		registry.status().filter((task) => task.adopted).length,
+		0,
+		"nothing from the foreign pool is listed",
+	);
+	assert.ok(existsSync(manifestPath), "the foreign manifest is left untouched");
+	registry.kill(holder.id, "SIGKILL");
+	await waitFor(() => registry.status(holder.id)[0].status !== "running");
+	registry.dispose();
+});
+
+test("legacy manifests without ownerPid are adopted and re-owned", async () => {
+	// Pre-ownership artifacts (e.g. survivors started before the upgrade) must
+	// keep their re-adoption contract, and adoption transfers ownership so a
+	// later concurrent starter sees a live owner and stays out.
+	const shared = tempDir("det legacy-owner");
+	const registry = freshRegistry({ detachedDirPath: shared });
+	const holder = registry.start({ command: "sleep 30", timeoutMs: 0 });
+	await waitFor(() => registry.status(holder.id)[0].status === "running");
+	const dir = join(shared, "s-legacy");
+	mkdirSync(dir, { recursive: true });
+	const manifestPath = join(dir, "legacy.json");
+	writeFileSync(
+		manifestPath,
+		JSON.stringify({
+			version: 1,
+			pid: holder.pid,
+			command: "sleep 30",
+			label: "legacy",
+			cwd: process.cwd(),
+			startedAt: Date.now(),
+			hostname: hostname(),
+			stdoutPath: join(dir, "o.log"),
+			stderrPath: join(dir, "e.log"),
+			statusPath: join(dir, ".exit"),
+		}),
+	);
+	assert.equal(registry.adoptDetached(), 1, "no ownerPid — adoptable (legacy)");
+	const adopted = registry.status().find((task) => task.adopted);
+	assert.ok(adopted !== undefined);
+	const after = JSON.parse(readFileSync(manifestPath, "utf8"));
+	assert.equal(after.ownerPid, process.pid, "adoption claims ownership on disk");
+	registry.kill(holder.id, "SIGKILL");
+	await waitFor(() => registry.status(holder.id)[0].status !== "running");
+	registry.dispose();
 });
 
 test("toWslPath translates Windows drive paths and rejects the rest", () => {

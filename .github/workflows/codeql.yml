@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # edited matters: a stacked PR retargeted to main after its base branch
+    # merges only emits pull_request.edited — without it here, CodeQL stays
+    # "Expected — Waiting for status to be reported" forever (hit on #19).
+    types: [opened, synchronize, reopened, edited]
   schedule:
     - cron: "30 20 * * 3"
 
