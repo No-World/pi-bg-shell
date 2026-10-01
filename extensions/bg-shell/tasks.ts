@@ -18,6 +18,35 @@ import { join } from "node:path";
 
 export type TaskStatus = "running" | "completed" | "failed" | "killed" | "timeout";
 
+/** Literal-substring watch over completed output lines (ADR-0005). */
+export interface PatternSpec {
+	/** Literal substring to match against each completed output line. */
+	literal: string;
+	/** Fire on every matching line instead of only the first. */
+	all?: boolean;
+	/** After delivering a match, stop the task (SIGTERM path). */
+	stop?: boolean;
+	/** Minimum gap between fires in `all` mode. Test knob; default 10 s. */
+	minFireIntervalMs?: number;
+}
+
+/** Live state of an armed pattern, surfaced on every snapshot. */
+export interface PatternState {
+	literal: string;
+	matches: number;
+	lastLine: string;
+	lastAt: number;
+	lastStream: "stdout" | "stderr";
+}
+
+/** A delivery-time event about a still-running task (ADR-0005). */
+export interface RunningEvent {
+	kind: "pattern" | "report";
+	stream?: "stdout" | "stderr";
+	line?: string;
+	matches?: number;
+}
+
 export interface StartParams {
 	command: string;
 	cwd?: string;
@@ -25,6 +54,10 @@ export interface StartParams {
 	timeoutMs?: number;
 	env?: Record<string, string>;
 	label?: string;
+	/** Wake the agent when an output line matches (task keeps running unless stop). */
+	pattern?: PatternSpec;
+	/** While running, deliver a progress report every this many ms. */
+	reportEveryMs?: number;
 }
 
 export interface TaskSnapshot {
@@ -41,6 +74,10 @@ export interface TaskSnapshot {
 	finishedAt: number | undefined;
 	durationMs: number | undefined;
 	timeoutMs: number;
+	/** Armed pattern state; undefined when no pattern was given. */
+	pattern: PatternState | undefined;
+	/** Progress-report interval while running; undefined when off. */
+	reportEveryMs: number | undefined;
 	stdoutBytes: number;
 	stderrBytes: number;
 	stdoutTruncated: boolean;
@@ -190,6 +227,44 @@ export interface RegistryOptions {
 	now?: () => number;
 }
 
+/** Very long unterminated lines are still tested once they pass this cap. */
+const MAX_PENDING_LINE_CHARS = 64 * 1024;
+
+/**
+ * Splits streamed bytes into completed lines and tests each against a
+ * literal substring, grep-style. Pending partial lines are buffered per
+ * stream; a line longer than the cap is tested mid-flight so a match on an
+ * unterminated firehose is not deferred forever.
+ */
+export class LineMatcher {
+	private readonly pending: Record<"stdout" | "stderr", string> = { stdout: "", stderr: "" };
+	private readonly literal: string;
+	private readonly sink: (line: string, stream: "stdout" | "stderr") => void;
+
+	constructor(literal: string, sink: (line: string, stream: "stdout" | "stderr") => void) {
+		this.literal = literal;
+		this.sink = sink;
+	}
+
+	feed(chunk: Buffer, stream: "stdout" | "stderr"): void {
+		if (chunk.length === 0) return;
+		const text = this.pending[stream] + chunk.toString("utf8");
+		const parts = text.split("\n");
+		this.pending[stream] = parts.pop() ?? "";
+		for (const part of parts) this.test(part, stream);
+		if (this.pending[stream].length > MAX_PENDING_LINE_CHARS) {
+			const overflow = this.pending[stream];
+			this.pending[stream] = "";
+			this.test(overflow, stream);
+		}
+	}
+
+	private test(line: string, stream: "stdout" | "stderr"): void {
+		if (line.endsWith("\r")) line = line.slice(0, -1);
+		if (line.includes(this.literal)) this.sink(line, stream);
+	}
+}
+
 /** Env var overriding the default task timeout. Read once at load (ADR-0004). */
 export const DEFAULT_TIMEOUT_ENV = "PI_BG_SHELL_TIMEOUT_SEC";
 
@@ -216,6 +291,13 @@ interface TaskInternal {
 	stderr: OutputBuffer;
 	timeoutTimer: ReturnType<typeof setTimeout> | undefined;
 	killTimer: ReturnType<typeof setTimeout> | undefined;
+	reportTimer: ReturnType<typeof setInterval> | undefined;
+	patternCtl: {
+		spec: PatternSpec;
+		matcher: LineMatcher;
+		fired: boolean;
+		lastFireAt: number;
+	} | undefined;
 	killedByUser: boolean;
 	timedOut: boolean;
 	finalized: boolean;
@@ -230,6 +312,9 @@ export class TaskRegistry {
 	private readonly options: RegistryOptions;
 
 	public onExit: ((snapshot: TaskSnapshot, output: TaskOutput) => void) | undefined;
+
+	/** Delivery-time events about still-running tasks (ADR-0005); rebound per load like onExit. */
+	public onRunningEvent: ((snapshot: TaskSnapshot, output: TaskOutput, event: RunningEvent) => void) | undefined;
 
 	constructor(options: RegistryOptions = {}) {
 		this.options = options;
@@ -275,6 +360,13 @@ export class TaskRegistry {
 		const timeoutMs = Math.max(0, params.timeoutMs ?? this.defaultTimeoutMs);
 		const cwd = params.cwd?.trim() || process.cwd();
 		const label = params.label?.trim() || command.slice(0, 60);
+		if (params.pattern !== undefined && !params.pattern.literal) {
+			throw new Error("pattern.literal must be a non-empty string");
+		}
+		const reportEveryMs = params.reportEveryMs !== undefined ? Math.max(0, params.reportEveryMs) : undefined;
+		const patternState: PatternState | undefined = params.pattern
+			? { literal: params.pattern.literal, matches: 0, lastLine: "", lastAt: 0, lastStream: "stdout" }
+			: undefined;
 
 		const id = this.nextId++;
 		const dir = this.ensureSpillDir();
@@ -296,6 +388,8 @@ export class TaskRegistry {
 				finishedAt: undefined,
 				durationMs: undefined,
 				timeoutMs,
+				pattern: patternState,
+				reportEveryMs,
 				stdoutBytes: 0,
 				stderrBytes: 0,
 				stdoutTruncated: false,
@@ -308,6 +402,8 @@ export class TaskRegistry {
 			stderr: new OutputBuffer(this.maxBufferBytes, join(dir, `${id}.stderr.log`)),
 			timeoutTimer: undefined,
 			killTimer: undefined,
+			reportTimer: undefined,
+			patternCtl: undefined,
 			killedByUser: false,
 			timedOut: false,
 			finalized: false,
@@ -325,18 +421,29 @@ export class TaskRegistry {
 		}
 		task.child = child;
 		task.snapshot.pid = child.pid;
+		if (params.pattern !== undefined) {
+			const spec = params.pattern;
+			task.patternCtl = {
+				spec,
+				matcher: new LineMatcher(spec.literal, (line, stream) => this.handlePatternMatch(task, line, stream)),
+				fired: false,
+				lastFireAt: 0,
+			};
+		}
 
 		child.stdout?.on("data", (chunk: Buffer) => {
 			task.stdout.append(chunk);
 			task.snapshot.stdoutBytes = task.stdout.byteLength;
 			task.snapshot.stdoutTruncated = task.stdout.truncated;
 			task.snapshot.stdoutSpillPath = task.stdout.spillPath;
+			task.patternCtl?.matcher.feed(chunk, "stdout");
 		});
 		child.stderr?.on("data", (chunk: Buffer) => {
 			task.stderr.append(chunk);
 			task.snapshot.stderrBytes = task.stderr.byteLength;
 			task.snapshot.stderrTruncated = task.stderr.truncated;
 			task.snapshot.stderrSpillPath = task.stderr.spillPath;
+			task.patternCtl?.matcher.feed(chunk, "stderr");
 		});
 		child.on("error", (error: Error) => {
 			// spawn failures (missing cwd, fork limits) surface here; when the
@@ -355,6 +462,10 @@ export class TaskRegistry {
 				task.killTimer = setTimeout(() => this.signalChild(task, "SIGKILL"), this.killGraceMs);
 			}, timeoutMs);
 		}
+		if (reportEveryMs !== undefined && reportEveryMs > 0) {
+			task.reportTimer = setInterval(() => this.handleReport(task), reportEveryMs);
+			task.reportTimer.unref?.();
+		}
 		this.evictFinished();
 		return { ...task.snapshot };
 	}
@@ -367,11 +478,51 @@ export class TaskRegistry {
 		}
 	}
 
+	private handlePatternMatch(task: TaskInternal, line: string, stream: "stdout" | "stderr"): void {
+		const ctl = task.patternCtl;
+		const state = task.snapshot.pattern;
+		if (!ctl || !state || task.finalized) return;
+		state.matches += 1;
+		state.lastLine = line;
+		state.lastAt = this.now();
+		state.lastStream = stream;
+		const minInterval = Math.max(0, ctl.spec.minFireIntervalMs ?? 10_000);
+		if (!ctl.spec.all) {
+			if (ctl.fired) return; // single-shot: later matches still count, but never re-fire
+			ctl.fired = true;
+		} else if (state.matches > 1 && state.lastAt - ctl.lastFireAt < minInterval) {
+			return; // rate-limited: log floods must not stampede the session
+		}
+		ctl.lastFireAt = state.lastAt;
+		this.emitRunningEvent(task, { kind: "pattern", stream, line, matches: state.matches });
+		if (ctl.spec.stop) {
+			// Deliver first, then stop the task on the agent's instruction;
+			// the normal kill path applies (killed status + completion notify).
+			this.kill(task.snapshot.id, "SIGTERM");
+		}
+	}
+
+	private handleReport(task: TaskInternal): void {
+		if (task.finalized) return;
+		this.emitRunningEvent(task, { kind: "report" });
+	}
+
+	private emitRunningEvent(task: TaskInternal, event: RunningEvent): void {
+		const snapshot = { ...task.snapshot };
+		if (task.snapshot.pattern !== undefined) snapshot.pattern = { ...task.snapshot.pattern };
+		try {
+			this.onRunningEvent?.(snapshot, this.outputFor(task), event);
+		} catch {
+			// A broken consumer must not break the output pipeline.
+		}
+	}
+
 	private finalize(task: TaskInternal, code: number | null, signal: string | null): void {
 		if (task.finalized) return;
 		task.finalized = true;
 		if (task.timeoutTimer !== undefined) clearTimeout(task.timeoutTimer);
 		if (task.killTimer !== undefined) clearTimeout(task.killTimer);
+		if (task.reportTimer !== undefined) clearInterval(task.reportTimer);
 		const snapshot = task.snapshot;
 		snapshot.exitCode = code;
 		snapshot.signal = signal;
@@ -471,6 +622,7 @@ export class TaskRegistry {
 		this.disposed = true;
 		this.killAll("SIGTERM");
 		for (const task of this.tasks.values()) {
+			if (task.reportTimer !== undefined) clearInterval(task.reportTimer);
 			if (!task.finalized) {
 				// Children that ignore SIGTERM still hold fds into the spill
 				// dir; SIGKILL after the standard grace period is overkill at

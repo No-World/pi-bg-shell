@@ -42,6 +42,14 @@ _Avoid_: 推送/push（不是网络语义）、回调（那是实现层 `onExit`
 并行任务同时退出时逐条 triggerTurn 导致 agent 连开多轮的现象；debounce 合并窗口是其防线。
 _Avoid_: 风暴合并（合并是手段，风暴才是问题名）。
 
+**模式唤醒**：
+`on_pattern` 的字面子串、逐行（grep 语义）监视；首次命中即唤醒，任务继续运行，`stop` 模式在投递后停任务。命中次数在快照上作 running 的子状态呈现（`running·matched×N`）。
+_Avoid_: 触发器（那是调度器词汇；这里只改交付时机）、正则（显式取舍：字面匹配就够，转义坑不背）。
+
+**进度报告**：
+`report_every_sec` 的运行中心跳：每 N 秒投递「已运行时长 + 输出尾部」，不中断任务；任务退出即停。
+_Avoid_: 轮询（报告是推送，不是 agent 主动查）、心跳检测（那是存活探测语义，报告携带的是内容）。
+
 **exit 钩子**：
 注册表上的 `onExit(snapshot, output)`，入口工厂每次加载重绑到当前 runtime 的 notifier（PITFALLS P1 的防线本体）。
 _Avoid_: 监听器（会被误解为 DOM 式多播；它是单槽、可覆盖）。

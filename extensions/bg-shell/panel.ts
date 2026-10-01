@@ -231,6 +231,17 @@ export class BgPanelComponent {
 					: ""),
 		);
 		lines.push(theme.fg("muted" as never, ` cmd: ${task.command}`));
+		if (task.pattern !== undefined) {
+			const state = task.pattern;
+			const text =
+				state.matches === 0
+					? `pattern "${state.literal}" armed, no match yet`
+					: `pattern "${state.literal}" ×${state.matches}, last: ${state.lastLine.slice(0, 120)}`;
+			lines.push(theme.fg("muted" as never, ` ${text}`));
+		}
+		if (task.reportEveryMs !== undefined && task.status === "running") {
+			lines.push(theme.fg("muted" as never, ` report every ${Math.round(task.reportEveryMs / 1000)}s`));
+		}
 		if (task.errorMessage !== undefined) {
 			lines.push(theme.fg("error" as never, ` error: ${task.errorMessage}`));
 		}
