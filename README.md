@@ -44,6 +44,19 @@ Notify:  Background task #4 pattern match (on_pattern "ROOTED", match #1, runnin
 
 Both are delivery-timing controls, not orchestration: what to do next stays with the woken agent in the conversation.
 
+### Detached tasks (survive quitting pi)
+
+`bash_bg { detach: true }` runs the command in its own session (setsid) with output going straight to files — quitting pi **does not kill it** (rebooting the machine still does). The real exit code is recorded by a wrapper; a manifest under `tmpdir()/pi-bg-shell/` lets the **next pi session re-adopt** the task automatically: alive ones resume tracking (completion wakes, `on_pattern` keeps watching), already-dead ones register their outcome silently in `bg_status`. The default timeout is off for detached tasks — pass `timeout_sec` explicitly if you want one.
+
+```
+You:     start the 24h device soak, detached, wake me on ROOTED
+Agent:   bash_bg {command: "./soak.sh", detach: true, on_pattern: "ROOTED"}
+… pi quits, reopened next morning …
+Notify:  Background task #1 pattern match (on_pattern "ROOTED", match #1, running 9h12m): ./soak.sh
+```
+
+`bg_kill` signals the detached task's whole process group.
+
 ## User surface
 
 While tasks run, a one-line status widget sits above the editor (the fleet-style bar):

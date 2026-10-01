@@ -44,6 +44,19 @@ Notify:  Background task #4 pattern match (on_pattern "ROOTED", match #1, runnin
 
 两者都只控制「何时交付信息」，不是编排：被唤醒后的下一步仍由 agent 在对话里决定。
 
+### 脱离任务（活过 pi 退出）
+
+`bash_bg { detach: true }` 让命令在自己的 session（setsid）里跑，输出直写文件——退出 pi **不会杀它**（重启机器仍会）。真实退出码由包装层落盘；`tmpdir()/pi-bg-shell/` 下的清单让**下个 pi 会话自动领养**：活着的恢复跟踪（完成唤醒、on_pattern 继续监视），已死的静默登记终态供 bg_status 查。脱离任务默认不限时——需要限时就显式传 `timeout_sec`。
+
+```
+You:     把 24h 设备烤机跑起来，脱离，ROOTED 了叫我
+Agent:   bash_bg {command: "./soak.sh", detach: true, on_pattern: "ROOTED"}
+… pi 退出，次日重开 …
+Notify:  Background task #1 pattern match (on_pattern "ROOTED", match #1, running 9h12m): ./soak.sh
+```
+
+`bg_kill` 对脱离任务发整进程组信号。
+
 ## 用户界面
 
 任务运行期间，编辑器上方常驻一行状态条（fleet 风格）：

@@ -12,8 +12,24 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { closeSync, mkdirSync, mkdtempSync, openSync, rmSync, writeSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
+import {
+	closeSync,
+	existsSync,
+	fstatSync,
+	ftruncateSync,
+	lstatSync,
+	mkdirSync,
+	mkdtempSync,
+	openSync,
+	readdirSync,
+	readFileSync,
+	readSync,
+	rmSync,
+	statSync,
+	writeSync,
+} from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 
 export type TaskStatus = "running" | "completed" | "failed" | "killed" | "timeout";
@@ -58,6 +74,8 @@ export interface StartParams {
 	pattern?: PatternSpec;
 	/** While running, deliver a progress report every this many ms. */
 	reportEveryMs?: number;
+	/** Detached: survive pi quitting, output to files, re-adopted next session (ADR-0006). */
+	detach?: boolean;
 }
 
 export interface TaskSnapshot {
@@ -78,6 +96,10 @@ export interface TaskSnapshot {
 	pattern: PatternState | undefined;
 	/** Progress-report interval while running; undefined when off. */
 	reportEveryMs: number | undefined;
+	/** Detached: survives pi quitting, output in files (ADR-0006). */
+	detached: boolean;
+	/** Adopted from a previous session's manifest. */
+	adopted: boolean;
 	stdoutBytes: number;
 	stderrBytes: number;
 	stdoutTruncated: boolean;
@@ -222,6 +244,10 @@ export interface RegistryOptions {
 	killGraceMs?: number;
 	/** Finished tasks retained for bg_status. Older ones are evicted. Default 50. */
 	retainFinished?: number;
+	/** Poll interval for adopted detached tasks and detached pattern feeding. Default 2 s. */
+	adoptPollMs?: number;
+	/** Root dir for detached manifests/output. Default: tmpdir()/pi-bg-shell. Test seam. */
+	detachedDirPath?: string;
 	/** Injectable for tests. */
 	spawnFn?: typeof spawn;
 	now?: () => number;
@@ -265,6 +291,178 @@ export class LineMatcher {
 	}
 }
 
+/** Cross-session manifest for one detached task (ADR-0006). */
+export interface DetachedManifest {
+	version: 1;
+	pid: number;
+	command: string;
+	label: string;
+	cwd: string;
+	startedAt: number;
+	hostname: string;
+	stdoutPath: string;
+	stderrPath: string;
+	statusPath: string;
+	pattern: { literal: string; all: boolean; fired: boolean } | undefined;
+}
+
+/** Root dir for detached manifests/output; shared across sessions (ADR-0006). */
+function detachedDirRoot(): string {
+	return join(tmpdir(), "pi-bg-shell");
+}
+
+function ensureDir(root: string): string {
+	mkdirSync(root, { recursive: true, mode: 0o700 });
+	// A pre-existing root must be a real directory owned by us: a hostile
+	// local user pre-creating it (or symlinking it somewhere) must fail
+	// loudly here instead of feeding us entries we cannot trust. This guard
+	// backs the two codeql[js/insecure-temporary-file] suppressions below.
+	try {
+		const info = lstatSync(root);
+		const uid = process.getuid?.();
+		if (!info.isDirectory() || (uid !== undefined && info.uid !== uid)) {
+			throw new Error(`pi-bg-shell: refusing insecure detached dir ${root}`);
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	return root;
+}
+
+function shellSingleQuote(value: string): string {
+	return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function statSize(path: string): number {
+	try {
+		return statSync(path).size;
+	} catch {
+		return 0;
+	}
+}
+
+function pidAlive(pid: number | undefined): boolean {
+	if (pid === undefined || !Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+/** Exit code recorded by the detached wrapper's trailing printf; null = none yet. */
+function readExitCodeFile(path: string): number | null {
+	try {
+		const text = readFileSync(path, "utf8").trim();
+		if (text === "") return null;
+		const code = Number(text.split("\n").at(-1));
+		return Number.isInteger(code) ? code : null;
+	} catch {
+		return null;
+	}
+}
+
+function readManifest(path: string): DetachedManifest | undefined {
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+		if (typeof parsed !== "object" || parsed === null) return undefined;
+		const manifest = parsed as Partial<DetachedManifest>;
+		if (
+			manifest.version !== 1 ||
+			typeof manifest.pid !== "number" ||
+			typeof manifest.command !== "string" ||
+			typeof manifest.label !== "string" ||
+			typeof manifest.cwd !== "string" ||
+			typeof manifest.startedAt !== "number" ||
+			typeof manifest.hostname !== "string" ||
+			typeof manifest.stdoutPath !== "string" ||
+			typeof manifest.stderrPath !== "string" ||
+			typeof manifest.statusPath !== "string"
+		) {
+			return undefined;
+		}
+		if (
+			manifest.pattern !== undefined &&
+			(typeof manifest.pattern.literal !== "string" ||
+				typeof manifest.pattern.all !== "boolean" ||
+				typeof manifest.pattern.fired !== "boolean")
+		) {
+			return undefined;
+		}
+		return manifest as DetachedManifest;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Read-side tail over a detached task's output file. The file IS the full
+ * history (the child writes it directly), so `truncated` is true whenever
+ * the file exists and `spillPath` is the file itself. dispose() removes the
+ * file — quitting keeps running detached tasks out of dispose's path.
+ */
+export class FileTailSource {
+	private readonly path: string;
+
+	constructor(path: string) {
+		this.path = path;
+	}
+
+	get byteLength(): number {
+		try {
+			return statSync(this.path).size;
+		} catch {
+			return 0;
+		}
+	}
+
+	get truncated(): boolean {
+		return existsSync(this.path);
+	}
+
+	get spillPath(): string | undefined {
+		return existsSync(this.path) ? this.path : undefined;
+	}
+
+	tail(bytes: number): string {
+		let fd: number;
+		try {
+				// Token-randomized name inside our 0700, uid-checked dir (see ensureDir).
+				// codeql[js/insecure-temporary-file]
+				fd = openSync(this.path, "r");
+		} catch {
+			return "";
+		}
+		try {
+			// Size comes from the opened fd itself: stat-then-open would be a
+			// TOCTOU race with the detached child appending to this very file.
+			const size = fstatSync(fd).size;
+			const take = Math.max(0, Math.min(bytes, size));
+			if (take === 0) return "";
+			const buffer = Buffer.alloc(take);
+			readSync(fd, buffer, 0, take, size - take);
+			return buffer.toString("utf8");
+		} catch {
+			return "";
+		} finally {
+			closeSync(fd);
+		}
+	}
+
+	append(_chunk: Buffer): void {
+		// The detached child writes the file itself; the registry never appends.
+	}
+
+	dispose(): void {
+		try {
+			rmSync(this.path, { force: true });
+		} catch {
+			// Best effort only.
+		}
+	}
+}
+
 /** Env var overriding the default task timeout. Read once at load (ADR-0004). */
 export const DEFAULT_TIMEOUT_ENV = "PI_BG_SHELL_TIMEOUT_SEC";
 
@@ -287,8 +485,8 @@ export function defaultTimeoutMsFromEnv(
 interface TaskInternal {
 	snapshot: TaskSnapshot;
 	child: ChildProcess | undefined;
-	stdout: OutputBuffer;
-	stderr: OutputBuffer;
+	stdout: OutputBuffer | FileTailSource;
+	stderr: OutputBuffer | FileTailSource;
 	timeoutTimer: ReturnType<typeof setTimeout> | undefined;
 	killTimer: ReturnType<typeof setTimeout> | undefined;
 	reportTimer: ReturnType<typeof setInterval> | undefined;
@@ -298,6 +496,16 @@ interface TaskInternal {
 		fired: boolean;
 		lastFireAt: number;
 	} | undefined;
+	detachedPaths: {
+		manifestPath: string;
+		stdoutPath: string;
+		stderrPath: string;
+		statusPath: string;
+		/** Held-open fd for owned detached tasks; manifest updates go through it (exclusively created, 0600). */
+		manifestFd: number | undefined;
+	} | undefined;
+	adopted: boolean;
+	fileOffsets: { stdout: number; stderr: number } | undefined;
 	killedByUser: boolean;
 	timedOut: boolean;
 	finalized: boolean;
@@ -340,6 +548,10 @@ export class TaskRegistry {
 		return this.options.now?.() ?? Date.now();
 	}
 
+	private detachedRoot(): string {
+		return ensureDir(this.options.detachedDirPath ?? detachedDirRoot());
+	}
+
 	private ensureSpillDir(): string {
 		if (this.spillDir === undefined) {
 			this.spillDir = mkdtempSync(join(tmpdir(), "pi-bg-shell-"));
@@ -357,7 +569,10 @@ export class TaskRegistry {
 		if (this.disposed) throw new Error("TaskRegistry is disposed");
 		const command = params.command?.trim();
 		if (!command) throw new Error("command must be a non-empty string");
-		const timeoutMs = Math.max(0, params.timeoutMs ?? this.defaultTimeoutMs);
+		const detach = params.detach === true;
+		// Detached tasks exist to outlive sessions; a default timeout that kills
+		// them after 10 minutes would defeat the point (ADR-0006).
+		const timeoutMs = Math.max(0, params.timeoutMs ?? (detach ? 0 : this.defaultTimeoutMs));
 		const cwd = params.cwd?.trim() || process.cwd();
 		const label = params.label?.trim() || command.slice(0, 60);
 		if (params.pattern !== undefined && !params.pattern.literal) {
@@ -372,6 +587,49 @@ export class TaskRegistry {
 		const dir = this.ensureSpillDir();
 		const spawnFn = this.options.spawnFn ?? spawn;
 		const env = { ...process.env, ...(params.env ?? {}) };
+
+		// Detached artifacts: output files + exit-status file + manifest (ADR-0006).
+		let detachedPaths: TaskInternal["detachedPaths"];
+		let manifest: DetachedManifest | undefined;
+		let outFd: number | undefined;
+		let errFd: number | undefined;
+		if (detach) {
+			const ddir = this.detachedRoot();
+			const token = `${this.now().toString(36)}-${randomUUID().slice(0, 8)}`;
+			const stdoutPath = join(ddir, `${token}.stdout.log`);
+			const stderrPath = join(ddir, `${token}.stderr.log`);
+			const statusPath = join(ddir, `${token}.exit`);
+			const manifestPath = join(ddir, `${token}.json`);
+			manifest = {
+				version: 1,
+				pid: 0, // replaced after spawn
+				command,
+				label,
+				cwd,
+				startedAt: this.now(),
+				hostname: hostname(),
+				stdoutPath,
+				stderrPath,
+				statusPath,
+				pattern: params.pattern
+					? { literal: params.pattern.literal, all: params.pattern.all ?? false, fired: false }
+					: undefined,
+			};
+			outFd = openSync(stdoutPath, "wx", 0o600);
+			try {
+				errFd = openSync(stderrPath, "wx", 0o600);
+			} catch (error) {
+				closeSync(outFd);
+				throw error;
+			}
+			// Exclusive creation ("wx") + 0600: predictable tmpdir names are only
+			// safe when creation refuses to follow pre-existing files/symlinks —
+			// a bare writeFileSync with a mode would still be flagged (CodeQL
+			// js/insecure-temporary-file). Updates go through the held-open fd.
+			const manifestFd = openSync(manifestPath, "wx", 0o600);
+			writeSync(manifestFd, JSON.stringify(manifest, null, "\t"));
+			detachedPaths = { manifestPath, stdoutPath, stderrPath, statusPath, manifestFd };
+		}
 
 		const task: TaskInternal = {
 			snapshot: {
@@ -390,6 +648,8 @@ export class TaskRegistry {
 				timeoutMs,
 				pattern: patternState,
 				reportEveryMs,
+				detached: detach,
+				adopted: false,
 				stdoutBytes: 0,
 				stderrBytes: 0,
 				stdoutTruncated: false,
@@ -398,12 +658,15 @@ export class TaskRegistry {
 				stderrSpillPath: undefined,
 			},
 			child: undefined,
-			stdout: new OutputBuffer(this.maxBufferBytes, join(dir, `${id}.stdout.log`)),
-			stderr: new OutputBuffer(this.maxBufferBytes, join(dir, `${id}.stderr.log`)),
+			stdout: detach && detachedPaths ? new FileTailSource(detachedPaths.stdoutPath) : new OutputBuffer(this.maxBufferBytes, join(dir, `${id}.stdout.log`)),
+			stderr: detach && detachedPaths ? new FileTailSource(detachedPaths.stderrPath) : new OutputBuffer(this.maxBufferBytes, join(dir, `${id}.stderr.log`)),
 			timeoutTimer: undefined,
 			killTimer: undefined,
 			reportTimer: undefined,
 			patternCtl: undefined,
+			detachedPaths: detach ? detachedPaths : undefined,
+			adopted: false,
+			fileOffsets: undefined,
 			killedByUser: false,
 			timedOut: false,
 			finalized: false,
@@ -413,7 +676,20 @@ export class TaskRegistry {
 
 		let child: ChildProcess;
 		try {
-			child = spawnFn("bash", ["-c", command], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+			if (detach && detachedPaths && outFd !== undefined && errFd !== undefined) {
+				// The wrapper records the command's real exit code — the wrapper
+				// bash itself always exits 0 after its printf (ADR-0006).
+				const wrapped =
+					`( ${command}\n)\nprintf '%s\\n' "$?" > ${shellSingleQuote(detachedPaths.statusPath)}`;
+				child = spawnFn("bash", ["-c", wrapped], {
+					cwd,
+					env,
+					detached: true, // setsid: new process group, survives pi
+					stdio: ["ignore", outFd, errFd],
+				});
+			} else {
+				child = spawnFn("bash", ["-c", command], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+			}
 		} catch (error) {
 			task.snapshot.errorMessage = String(error);
 			this.finalize(task, null, null);
@@ -421,6 +697,10 @@ export class TaskRegistry {
 		}
 		task.child = child;
 		task.snapshot.pid = child.pid;
+		if (manifest !== undefined && child.pid !== undefined && detachedPaths !== undefined) {
+			manifest.pid = child.pid;
+			this.rewriteManifest(detachedPaths, manifest);
+		}
 		if (params.pattern !== undefined) {
 			const spec = params.pattern;
 			task.patternCtl = {
@@ -431,29 +711,39 @@ export class TaskRegistry {
 			};
 		}
 
-		child.stdout?.on("data", (chunk: Buffer) => {
-			task.stdout.append(chunk);
-			task.snapshot.stdoutBytes = task.stdout.byteLength;
-			task.snapshot.stdoutTruncated = task.stdout.truncated;
-			task.snapshot.stdoutSpillPath = task.stdout.spillPath;
-			task.patternCtl?.matcher.feed(chunk, "stdout");
-		});
-		child.stderr?.on("data", (chunk: Buffer) => {
-			task.stderr.append(chunk);
-			task.snapshot.stderrBytes = task.stderr.byteLength;
-			task.snapshot.stderrTruncated = task.stderr.truncated;
-			task.snapshot.stderrSpillPath = task.stderr.spillPath;
-			task.patternCtl?.matcher.feed(chunk, "stderr");
-		});
 		child.on("error", (error: Error) => {
 			// spawn failures (missing cwd, fork limits) surface here; when the
 			// child never spawned, 'close' may never fire — finalize directly.
 			if (task.snapshot.errorMessage === undefined) task.snapshot.errorMessage = error.message;
 			if (task.snapshot.pid === undefined) this.finalize(task, null, null);
 		});
-		child.on("close", (code, signal) => {
-			this.finalize(task, code, signal);
-		});
+		if (detach) {
+			child.unref();
+			if (outFd !== undefined) closeSync(outFd);
+			if (errFd !== undefined) closeSync(errFd);
+			// No pipes: the close event on our handle detects exit; the real
+			// exit code comes from the status file (the wrapper's own exit is 0).
+			child.on("close", (_code, signal) => this.finalizeDetached(task, signal));
+			if (task.patternCtl !== undefined) this.ensureDetachedPoll();
+		} else {
+			child.stdout?.on("data", (chunk: Buffer) => {
+				(task.stdout as OutputBuffer).append(chunk);
+				task.snapshot.stdoutBytes = task.stdout.byteLength;
+				task.snapshot.stdoutTruncated = task.stdout.truncated;
+				task.snapshot.stdoutSpillPath = task.stdout.spillPath;
+				task.patternCtl?.matcher.feed(chunk, "stdout");
+			});
+			child.stderr?.on("data", (chunk: Buffer) => {
+				(task.stderr as OutputBuffer).append(chunk);
+				task.snapshot.stderrBytes = task.stderr.byteLength;
+				task.snapshot.stderrTruncated = task.stderr.truncated;
+				task.snapshot.stderrSpillPath = task.stderr.spillPath;
+				task.patternCtl?.matcher.feed(chunk, "stderr");
+			});
+			child.on("close", (code, signal) => {
+				this.finalize(task, code, signal);
+			});
+		}
 
 		if (timeoutMs > 0) {
 			task.timeoutTimer = setTimeout(() => {
@@ -472,9 +762,302 @@ export class TaskRegistry {
 
 	private signalChild(task: TaskInternal, signal: NodeJS.Signals): void {
 		try {
-			task.child?.kill(signal);
+			if (task.detachedPaths !== undefined && task.snapshot.pid !== undefined) {
+				// Detached children are process-group leaders (setsid); signaling
+				// the group also reaches the wrapped command's descendants.
+				process.kill(-task.snapshot.pid, signal);
+			} else {
+				task.child?.kill(signal);
+			}
 		} catch {
 			// Process already gone.
+		}
+	}
+
+	/** Finalize a detached task: the real exit code lives in the status file. */
+	private finalizeDetached(task: TaskInternal, signal: string | null): void {
+		if (task.finalized) return;
+		const code = task.detachedPaths !== undefined ? readExitCodeFile(task.detachedPaths.statusPath) : null;
+		this.finalize(task, code, code === null ? signal : null);
+	}
+
+	// --- Detached adoption (ADR-0006) -------------------------------------
+
+	private detachedPollTimer: ReturnType<typeof setInterval> | undefined;
+
+	private ensureDetachedPoll(): void {
+		if (this.detachedPollTimer !== undefined || this.disposed) return;
+		const interval = Math.max(50, this.options.adoptPollMs ?? 2000);
+		this.detachedPollTimer = setInterval(() => this.pollDetached(), interval);
+		this.detachedPollTimer.unref?.();
+	}
+
+	private stopDetachedPollIfIdle(): void {
+		const busy = this.order.some(
+			(task) => !task.finalized && (task.adopted || (task.detachedPaths !== undefined && task.patternCtl !== undefined)),
+		);
+		if (!busy && this.detachedPollTimer !== undefined) {
+			clearInterval(this.detachedPollTimer);
+			this.detachedPollTimer = undefined;
+		}
+	}
+
+	private pollDetached(): void {
+		for (const task of [...this.order]) {
+			if (task.finalized || task.detachedPaths === undefined) continue;
+			this.feedPatternFromFiles(task);
+			if (task.adopted) {
+				// Status file content is the authoritative death signal (PID reuse
+				// cannot fake it); the pid check covers crashes before the printf.
+				const status = readExitCodeFile(task.detachedPaths.statusPath);
+				if (status !== null || !pidAlive(task.snapshot.pid)) {
+					this.finalizeDetached(task, null);
+				}
+			}
+		}
+		this.stopDetachedPollIfIdle();
+	}
+
+	/** Feed the pattern matcher from file growth since the last poll. */
+	private feedPatternFromFiles(task: TaskInternal): void {
+		if (task.patternCtl === undefined || task.detachedPaths === undefined) return;
+		if (task.fileOffsets === undefined) {
+			task.fileOffsets = {
+				stdout: statSize(task.detachedPaths.stdoutPath),
+				stderr: statSize(task.detachedPaths.stderrPath),
+			};
+		}
+		for (const stream of ["stdout", "stderr"] as const) {
+			const path = stream === "stdout" ? task.detachedPaths.stdoutPath : task.detachedPaths.stderrPath;
+			let fd: number;
+			try {
+				fd = openSync(path, "r");
+			} catch {
+				continue; // no output file (yet); the next poll retries
+			}
+			try {
+				// Authoritative size from the fd: the detached child appends to
+				// this file concurrently, so stat-then-read would race (CodeQL
+				// js/race-condition); appends after fstat just shorten this read.
+				const size = fstatSync(fd).size;
+				if (size < task.fileOffsets[stream]) task.fileOffsets[stream] = 0; // truncated/rotated
+				const delta = size - task.fileOffsets[stream];
+				if (delta > 0) {
+					const buffer = Buffer.alloc(delta);
+					readSync(fd, buffer, 0, delta, task.fileOffsets[stream]);
+					task.patternCtl.matcher.feed(buffer, stream);
+					task.fileOffsets[stream] = size;
+				}
+			} catch {
+				// Skip unreadable deltas; the next poll retries from the same offset.
+			} finally {
+				closeSync(fd);
+			}
+		}
+	}
+
+	/** Replay pre-adoption output for counting; optionally deliver one stale wake. */
+	private replayPatternHistory(task: TaskInternal, emit: boolean): void {
+		const ctl = task.patternCtl;
+		const state = task.snapshot.pattern;
+		if (!ctl || !state || task.detachedPaths === undefined) return;
+		const realConsumer = this.onRunningEvent;
+		if (!emit) this.onRunningEvent = undefined;
+		for (const stream of ["stdout", "stderr"] as const) {
+			const path = stream === "stdout" ? task.detachedPaths.stdoutPath : task.detachedPaths.stderrPath;
+			try {
+				const content = readFileSync(path, "utf8");
+				if (content !== "") ctl.matcher.feed(Buffer.from(content, "utf8"), stream);
+			} catch {
+				// No output file yet.
+			}
+		}
+		this.onRunningEvent = realConsumer;
+		ctl.lastFireAt = this.now();
+		if (emit && !ctl.fired && state.matches > 0) {
+			// The single-shot event happened while nobody watched — deliver it
+			// once, marked with the last matching line.
+			ctl.fired = true;
+			this.emitRunningEvent(task, {
+				kind: "pattern",
+				stream: state.lastStream,
+				line: state.lastLine,
+				matches: state.matches,
+			});
+			this.persistPatternFired(task);
+		}
+	}
+
+	private persistPatternFired(task: TaskInternal): void {
+		if (task.detachedPaths === undefined) return;
+		const manifest = readManifest(task.detachedPaths.manifestPath);
+		if (manifest?.pattern === undefined) return;
+		manifest.pattern.fired = true;
+		this.rewriteManifest(task.detachedPaths, manifest);
+	}
+
+	/**
+	 * Update a manifest through the held-open fd (owned tasks) or an "r+"
+	 * reopen (adopted tasks) — never a bare path write: predictable tmpdir
+	 * names must not be written via writeFileSync, which follows symlinks
+	 * (CodeQL js/insecure-temporary-file).
+	 */
+	private rewriteManifest(
+		paths: NonNullable<TaskInternal["detachedPaths"]>,
+		manifest: DetachedManifest,
+	): void {
+		const json = JSON.stringify(manifest, null, "\t");
+		try {
+			if (paths.manifestFd !== undefined) {
+				ftruncateSync(paths.manifestFd, 0);
+				writeSync(paths.manifestFd, json, 0);
+			} else {
+				// Inside our 0700, uid-checked dir; "r+" never creates.
+				// codeql[js/insecure-temporary-file]
+				const fd = openSync(paths.manifestPath, "r+");
+				try {
+					ftruncateSync(fd, 0);
+					writeSync(fd, json, 0);
+				} finally {
+					closeSync(fd);
+				}
+			}
+		} catch {
+			// Best effort: a stale manifest only degrades a future adoption.
+		}
+	}
+
+	/** Register a task from a previous session's manifest; returns its snapshot. */
+	private registerAdopted(manifest: DetachedManifest, manifestPath: string, deadOnArrival: boolean): TaskSnapshot {
+		const id = this.nextId++;
+		const task: TaskInternal = {
+			snapshot: {
+				id,
+				label: manifest.label,
+				command: manifest.command,
+				cwd: manifest.cwd,
+				pid: manifest.pid,
+				status: "running",
+				exitCode: null,
+				signal: null,
+				errorMessage: undefined,
+				startedAt: manifest.startedAt,
+				finishedAt: undefined,
+				durationMs: undefined,
+				timeoutMs: 0,
+				pattern:
+					manifest.pattern !== undefined
+						? { literal: manifest.pattern.literal, matches: 0, lastLine: "", lastAt: 0, lastStream: "stdout" }
+						: undefined,
+				reportEveryMs: undefined, // reports do not survive sessions; re-arm if needed
+				detached: true,
+				adopted: true,
+				stdoutBytes: statSize(manifest.stdoutPath),
+				stderrBytes: statSize(manifest.stderrPath),
+				stdoutTruncated: existsSync(manifest.stdoutPath),
+				stderrTruncated: existsSync(manifest.stderrPath),
+				stdoutSpillPath: existsSync(manifest.stdoutPath) ? manifest.stdoutPath : undefined,
+				stderrSpillPath: existsSync(manifest.stderrPath) ? manifest.stderrPath : undefined,
+			},
+			child: undefined,
+			stdout: new FileTailSource(manifest.stdoutPath),
+			stderr: new FileTailSource(manifest.stderrPath),
+			timeoutTimer: undefined,
+			killTimer: undefined,
+			reportTimer: undefined,
+			patternCtl: undefined,
+			detachedPaths: {
+				manifestPath,
+				stdoutPath: manifest.stdoutPath,
+				stderrPath: manifest.stderrPath,
+				statusPath: manifest.statusPath,
+				manifestFd: undefined, // adopted: updates reopen with "r+"
+			},
+			adopted: true,
+			fileOffsets: { stdout: statSize(manifest.stdoutPath), stderr: statSize(manifest.stderrPath) },
+			killedByUser: false,
+			timedOut: false,
+			finalized: false,
+		};
+		this.tasks.set(String(id), task);
+		this.order.push(task);
+		if (manifest.pattern !== undefined) {
+			const spec: PatternSpec = { literal: manifest.pattern.literal, all: manifest.pattern.all };
+			task.patternCtl = {
+				spec,
+				matcher: new LineMatcher(spec.literal, (line, stream) => this.handlePatternMatch(task, line, stream)),
+				fired: manifest.pattern.fired,
+				lastFireAt: this.now(),
+			};
+			this.replayPatternHistory(task, !deadOnArrival);
+		}
+		if (deadOnArrival) {
+			// It died while no session watched: register the outcome silently.
+			const consumer = this.onExit;
+			this.onExit = undefined;
+			this.finalizeDetached(task, null);
+			this.onExit = consumer;
+		} else {
+			this.ensureDetachedPoll();
+		}
+		this.evictFinished();
+		return { ...task.snapshot };
+	}
+
+	/** Scan the manifest dir and re-adopt tasks from previous sessions. */
+	adoptDetached(): number {
+		if (this.disposed) return 0;
+		const root = this.detachedRoot();
+		let entries: string[];
+		try {
+			entries = readdirSync(root);
+		} catch {
+			return 0;
+		}
+		const known = new Set(
+			this.order
+				.map((task) => task.detachedPaths?.manifestPath)
+				.filter((path): path is string => path !== undefined),
+		);
+		let adopted = 0;
+		for (const name of entries) {
+			if (!name.endsWith(".json")) continue;
+			const manifestPath = join(root, name);
+			if (known.has(manifestPath)) continue; // already tracked (post-reload)
+			const manifest = readManifest(manifestPath);
+			if (manifest === undefined) {
+				try {
+					rmSync(manifestPath, { force: true });
+				} catch {
+					// Junk file; ignore.
+				}
+				continue;
+			}
+			if (manifest.hostname !== hostname()) continue; // foreign tmp mount
+			if (!pidAlive(manifest.pid)) {
+				this.registerAdopted(manifest, manifestPath, true);
+				continue;
+			}
+			this.registerAdopted(manifest, manifestPath, false);
+			adopted += 1;
+		}
+		return adopted;
+	}
+
+	private removeManifest(task: TaskInternal): void {
+		if (task.detachedPaths === undefined) return;
+		if (task.detachedPaths.manifestFd !== undefined) {
+			try {
+				closeSync(task.detachedPaths.manifestFd);
+			} catch {
+				// Best effort only.
+			}
+			task.detachedPaths.manifestFd = undefined;
+		}
+		try {
+			rmSync(task.detachedPaths.manifestPath, { force: true });
+		} catch {
+			// Best effort only.
 		}
 	}
 
@@ -495,6 +1078,7 @@ export class TaskRegistry {
 		}
 		ctl.lastFireAt = state.lastAt;
 		this.emitRunningEvent(task, { kind: "pattern", stream, line, matches: state.matches });
+		if (task.detachedPaths !== undefined) this.persistPatternFired(task);
 		if (ctl.spec.stop) {
 			// Deliver first, then stop the task on the agent's instruction;
 			// the normal kill path applies (killed status + completion notify).
@@ -591,7 +1175,9 @@ export class TaskRegistry {
 
 	killAll(signal: NodeJS.Signals = "SIGTERM"): void {
 		for (const task of this.tasks.values()) {
-			if (!task.finalized) {
+			// Detached tasks outlive the session on purpose — quitting never
+			// signals them (ADR-0006).
+			if (!task.finalized && task.detachedPaths === undefined) {
 				task.killedByUser = true;
 				this.signalChild(task, signal);
 			}
@@ -614,16 +1200,35 @@ export class TaskRegistry {
 			if (index >= 0) this.order.splice(index, 1);
 			oldest.stdout.dispose();
 			oldest.stderr.dispose();
+			if (oldest.detachedPaths !== undefined) this.removeManifest(oldest);
 		}
 	}
 
-	/** Drop all tracked state and delete spill files. Running children get SIGTERM first. */
+	/** Drop all tracked state and delete spill files. Running detached tasks survive. */
 	dispose(): void {
 		this.disposed = true;
+		if (this.detachedPollTimer !== undefined) {
+			clearInterval(this.detachedPollTimer);
+			this.detachedPollTimer = undefined;
+		}
 		this.killAll("SIGTERM");
 		for (const task of this.tasks.values()) {
 			if (task.reportTimer !== undefined) clearInterval(task.reportTimer);
+			const detached = task.detachedPaths !== undefined;
 			if (!task.finalized) {
+				if (detached) {
+					// Survivors keep files and keep running; close our manifest fd —
+					// the JSON is already on disk, adoption reads it from there.
+					if (task.detachedPaths?.manifestFd !== undefined) {
+						try {
+							closeSync(task.detachedPaths.manifestFd);
+						} catch {
+							// Best effort only.
+						}
+						task.detachedPaths.manifestFd = undefined;
+					}
+					continue;
+				}
 				// Children that ignore SIGTERM still hold fds into the spill
 				// dir; SIGKILL after the standard grace period is overkill at
 				// quit time — the OS reaps them with pi's process group.
@@ -631,6 +1236,7 @@ export class TaskRegistry {
 			}
 			task.stdout.dispose();
 			task.stderr.dispose();
+			if (detached) this.removeManifest(task);
 		}
 		this.tasks.clear();
 		this.order.length = 0;
