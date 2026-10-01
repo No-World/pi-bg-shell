@@ -43,3 +43,13 @@
 **Avoid**: 所有 sendMessage 调用走 CompletionNotifier 的「一次有界重试」路径，不要绕过它直接调 `pi.sendMessage`。
 
 **Recovery**: 重试仍失败时输出并未丢——溢写文件与 `bg_status` 仍是事实源；agent 下次查询即可找回。
+
+### P4: 脏工作树上跑门禁会给出假绿（提交缺失文件，本地却全过）
+
+**Trap**: 按仓库规矩用显式路径 `git add <paths>` 暂存，漏掉某个已改文件（如测试工厂的类型字段补丁）；随后在工作树上跑 `npm test && npm run typecheck` 全绿——验证的是「工作树」而不是「提交」。推送后 CI checkout 纯提交即炸（PR #8/#9 首轮 TS2322，2026-10-01）。
+
+**Why**: typecheck/测试读的是磁盘文件，与暂存区/提交内容无关；显式路径暂存与脏树验证叠加，恰好把缺口藏到 push 之后。
+
+**Avoid**: 提交后、push 前对**提交内容**跑一次门禁：`git stash -u && npm test && npm run typecheck && git stash pop`，或 checkout 到提交上验证；栈式多提交时逐提交验证（`git rebase -i` 的 edit 停点处跑）。
+
+**Recovery**: CI 红了先比对 `git diff <CI上的提交> --stat` 与工作树；缺失文件补回对应栈层（rebase edit + amend），force-push 前逐提交重验。
