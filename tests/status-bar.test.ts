@@ -26,7 +26,7 @@ function plainTheme(): StatusTheme & { roles: string[] } {
 }
 
 function activity(overrides: Partial<TaskActivity> = {}): TaskActivity {
-	return { deltaBytes: 0, lastLine: "", ...overrides };
+	return { totalBytes: 0, lastLine: "", ...overrides };
 }
 
 function snapshot(overrides: Partial<TaskSnapshot> = {}): TaskSnapshot {
@@ -176,14 +176,14 @@ test("formatStatusBarLines rotates the spinner with the tick phase", () => {
 	assert.notEqual(first[1], second[1]);
 });
 
-test("formatStatusBarLines adds a ⎿ activity line with delta and last output", () => {
+test("formatStatusBarLines adds a ⎿ activity line with total bytes and last output", () => {
 	const theme = plainTheme();
 	const lines = formatStatusBarLines(
 		{
 			running: [snapshot({ stdoutBytes: 18_400, stderrBytes: 0 })],
 			now: Date.now(),
 			tick: 0,
-			activity: new Map([[1, activity({ deltaBytes: 2150, lastLine: "[00:19:48] chatty heartbeat #112" })]]),
+			activity: new Map([[1, activity({ totalBytes: 18_400, lastLine: "[00:19:48] chatty heartbeat #112" })]]),
 		},
 		theme,
 		WIDE,
@@ -192,7 +192,6 @@ test("formatStatusBarLines adds a ⎿ activity line with delta and last output",
 	const subline = lines.find((line) => line.includes("⎿"));
 	assert.ok(subline !== undefined);
 	assert.match(subline, /↓ 18\.0k/);
-	assert.match(subline, /\(\+2\.1k\)/);
 	assert.match(subline, /chatty heartbeat #112/);
 });
 
@@ -227,7 +226,7 @@ test("formatStatusBarLines never exceeds the requested width", () => {
 			running: [snapshot({ label: "a-very-long-label".repeat(4), command: `echo ${"x".repeat(120)}` })],
 			now: Date.now(),
 			tick: 0,
-			activity: new Map([[1, activity({ deltaBytes: 9, lastLine: "y".repeat(120) })]]),
+			activity: new Map([[1, activity({ totalBytes: 9, lastLine: "y".repeat(120) })]]),
 		},
 		theme,
 		40,
@@ -246,15 +245,15 @@ test("formatStatusBarLines colors roles per section", () => {
 			running: [snapshot()],
 			now: Date.now(),
 			tick: 0,
-			activity: new Map([[1, activity({ deltaBytes: 512, lastLine: "boom" })]]),
+			activity: new Map([[1, activity({ totalBytes: 512, lastLine: "boom" })]]),
 		},
 		theme,
 		WIDE,
 	);
-	assert.ok(theme.roles.includes("accent"));
+	// Header and task label stay uncolored (plain white) by design; only
+	// chrome, stats, and output carry theme roles.
 	assert.ok(theme.roles.includes("dim"));
 	assert.ok(theme.roles.includes("muted"));
-	assert.ok(theme.roles.includes("success"));
 	assert.ok(theme.roles.includes("toolOutput"));
 });
 
@@ -295,14 +294,13 @@ test("BgStatusBar feeds output tails into the activity line", () => {
 	bar.refresh([snapshot()]);
 	let lines = ui.render();
 	assert.ok(lines.some((line) => line.includes("chatty heartbeat #112")));
-	assert.ok(!lines.some((line) => line.includes("(+"))); // first paint: baseline only, no delta
 	bytes = 3150;
 	tail += "[00:19:50] chatty heartbeat #113 ······ payload bytes flowing\n";
 	timer.fire();
 	lines = ui.render();
 	const subline = lines.find((line) => line.includes("⎿"));
 	assert.ok(subline !== undefined);
-	assert.match(subline, /\(\+2\.1k\)/);
+	assert.match(subline, /↓ 3\.1k/);
 	assert.match(subline, /heartbeat #113/); // last line advanced
 });
 

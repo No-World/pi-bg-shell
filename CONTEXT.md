@@ -13,8 +13,8 @@ _Avoid_: 子 agent（那是 pi-subagents 的完整 agent 会话；后台任务�
 _Avoid_: fleet 视图（那是 subagent 的词；这里是任务面板）、列表命令（面板是弹窗不是列表输出）。
 
 **状态窗**：
-有任务运行时常驻输入框上方的卡片式 widget（表头 + 每任务一张卡：spinner/label/计时 + `cmd:` 原始命令 + `⎿ ↓ 总量 (+增量) · 最新输出行`），主题着色、按终端宽度截断，500ms 活重绘，无任务自动连 ticker 一起消失；fork 自 pi-subagents 的 async 卡片样式。
-_Avoid_: 状态栏/footer（footer 是 pi 底栏；状态窗是输入框上方 widget）、toast（那是 notify 瞬时提示）、树形连接符/▶ 装饰（v1 遗留，已删）。
+有任务运行时常驻输入框上方的卡片式 widget（表头 + 每任务一张卡：spinner/label/计时 + `cmd:` 原始命令 + `⎿ ↓ 总量 · 最新输出行`），表头与任务名白色、其余分区主题着色，按终端宽度截断，500ms 活重绘，无任务自动连 ticker 一起消失；fork 自 pi-subagents 的 async 卡片样式。
+_Avoid_: 状态栏/footer（footer 是 pi 底栏；状态窗是输入框上方 widget）、toast（那是 notify 瞬时提示）、树形连接符/▶ 装饰与字节增量标注（v1/v2 遗留，已删）。
 
 **任务状态**：
 五值：`running` / `completed`（退出码 0）/ `failed`（非 0 或 spawn 失败）/ `killed`（被 `bg_kill`）/ `timeout`（超时击杀）。

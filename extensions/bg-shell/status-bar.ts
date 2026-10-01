@@ -115,8 +115,8 @@ export interface StatusTheme {
 
 /** Live per-task facts recomputed on every tick. */
 export interface TaskActivity {
-	/** stdout+stderr bytes produced since the previous tick. */
-	deltaBytes: number;
+	/** stdout+stderr bytes so far — read fresh from the registry each tick. */
+	totalBytes: number;
 	/** Last non-empty output line (stdout preferred, stderr fallback). */
 	lastLine: string;
 }
@@ -153,13 +153,12 @@ export function formatStatusBarLines(
 	const shown = running.slice(0, MAX_TASKS_SHOWN);
 	const overflow = running.length - shown.length;
 
-	const lines = [theme.fg("accent" as never, "bg · background")];
+	const lines = ["bg · background"];
 	shown.forEach((task, index) => {
 		const spinner = SPINNER_FRAMES[(tick + index) % SPINNER_FRAMES.length];
 		const seconds = Math.max(0, Math.floor((now - task.startedAt) / 1000));
 		const row =
-			`   ${theme.fg("accent" as never, spinner)} ` +
-			`${theme.fg("accent" as never, `#${task.id} ${task.label}`)}` +
+			`   ${spinner} #${task.id} ${task.label}` +
 			`${theme.fg("dim" as never, " · running · ")}` +
 			`${theme.fg("muted" as never, formatElapsed(seconds))}`;
 		lines.push(truncateStyled(row, width));
@@ -171,18 +170,14 @@ export function formatStatusBarLines(
 		lines.push(cmd);
 
 		const live = activity.get(task.id);
-		if (live && (live.lastLine !== "" || live.deltaBytes > 0)) {
-			const growth =
-				live.deltaBytes > 0 ? theme.fg("success" as never, ` (+${formatBytes(live.deltaBytes)})`) : "";
+		if (live && (live.lastLine !== "" || live.totalBytes > 0)) {
 			const detail =
 				live.lastLine !== ""
 					? `${theme.fg("dim" as never, " · ")}${theme.fg("toolOutput" as never, live.lastLine)}`
 					: "";
 			lines.push(
 				truncateStyled(
-					`     ${theme.fg("dim" as never, "⎿  ")}${theme.fg("muted" as never, `↓ ${formatBytes(
-						task.stdoutBytes + task.stderrBytes,
-					)}`)}${growth}${detail}`,
+					`     ${theme.fg("dim" as never, "⎿  ")}${theme.fg("muted" as never, `↓ ${formatBytes(live.totalBytes)}`)}${detail}`,
 					width,
 				),
 			);
@@ -246,7 +241,6 @@ export class BgStatusBar {
 	private tui: WidgetTui | undefined;
 	private theme: StatusTheme | undefined;
 	private activity = new Map<number, TaskActivity>();
-	private lastBytes = new Map<number, number>();
 
 	constructor(options: { timer?: WidgetTimer; refreshMs?: number; getOutput?: OutputProvider } = {}) {
 		this.timer = options.timer ?? defaultTimer;
@@ -273,11 +267,8 @@ export class BgStatusBar {
 	refresh(snapshots: TaskSnapshot[]): void {
 		this.running = snapshots.filter((task) => task.status === "running");
 		const live = new Set(this.running.map((task) => task.id));
-		for (const id of [...this.activity.keys(), ...this.lastBytes.keys()]) {
-			if (!live.has(id)) {
-				this.activity.delete(id);
-				this.lastBytes.delete(id);
-			}
+		for (const id of this.activity.keys()) {
+			if (!live.has(id)) this.activity.delete(id);
 		}
 		if (this.running.length > 0 && this.ui) this.ensureTimer();
 		else this.stopTimer();
@@ -287,7 +278,6 @@ export class BgStatusBar {
 	clear(): void {
 		this.running = [];
 		this.activity.clear();
-		this.lastBytes.clear();
 		this.stopTimer();
 		this.sync();
 	}
@@ -317,15 +307,12 @@ export class BgStatusBar {
 		for (const task of this.running) {
 			const output = this.getOutput(task.id);
 			if (output) {
-				const total = output.stdoutBytes + output.stderrBytes;
-				const previous = this.lastBytes.get(task.id);
 				const tail = output.stdoutTail || output.stderrTail;
 				const lastLine = tail.replace(/\n+$/, "").split("\n").filter((line) => line.trim() !== "").at(-1) ?? "";
 				this.activity.set(task.id, {
-					deltaBytes: previous === undefined ? 0 : Math.max(0, total - previous),
+					totalBytes: output.stdoutBytes + output.stderrBytes,
 					lastLine: lastLine.slice(0, 160),
 				});
-				this.lastBytes.set(task.id, total);
 			}
 		}
 		this.ensureRegistered();
