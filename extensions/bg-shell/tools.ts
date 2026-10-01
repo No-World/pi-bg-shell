@@ -16,7 +16,13 @@ const BashBgParams = Type.Object({
 	timeout_sec: Type.Optional(
 		Type.Number({ description: "Kill the task after this many seconds. Default 600; 0 disables the timeout." }),
 	),
-	env: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Extra environment variables." })),
+	env: Type.Optional(
+		Type.Record(Type.String(), Type.String(), {
+			description:
+				'Extra environment variables merged over the current one (e.g. {"ADB": "/opt/bin/adb"}). ' +
+				"Each task starts a fresh shell — pass variables here instead of re-declaring inline VAR=... prefixes in every command.",
+		}),
+	),
 	label: Type.Optional(Type.String({ description: "Short human label; defaults to the command prefix." })),
 });
 
@@ -101,11 +107,14 @@ export function bashBgTool(deps: BgToolDeps) {
 			"Run a shell command in the background and return immediately with a task id. " +
 			"Use this instead of bash for long-running commands (builds, test suites, dev servers, file watches, retries with sleep) " +
 			"so the session stays responsive. When the command exits, a completion notification with the output tail arrives automatically — do not poll.",
-		promptSnippet: "bash_bg — run a shell command in the background; output is delivered when it exits",
+		promptSnippet:
+			"bash_bg — run a shell command in the background; output is delivered when it exits; " +
+			"cwd/env params set the working directory and variables (fresh shell per task)",
 		promptGuidelines: [
 			"Prefer bash_bg over bash for any command expected to take longer than a few seconds (builds, test suites, dev servers, watches).",
 			"bash_bg returns immediately; results arrive as a bg-shell-notify completion message — never poll in a loop, just continue other work.",
 			"Progress checks and terminations go through bg_status and bg_kill, not ps/grep/kill via bash.",
+			"Each bash_bg task runs in a fresh bash -c shell with no session state — pass cwd and env instead of re-declaring inline VAR=... prefixes in every command.",
 		],
 		parameters: BashBgParams,
 		executionMode: "sequential" as const,
@@ -199,10 +208,12 @@ export function bgKillTool(deps: BgToolDeps) {
 		name: "bg_kill",
 		label: "Kill background task",
 		description:
-			"Terminate a background shell task by id (default SIGTERM). Use for dev servers or watches that no longer need to run.",
+			"Terminate a background shell task by id (default SIGTERM). Use for dev servers or watches that no longer need to run. " +
+			"Covers host-side registry tasks only.",
 		promptSnippet: "bg_kill — terminate a background task by id (id from bash_bg or a #N header)",
 		promptGuidelines: [
 			"Stop background tasks with bg_kill rather than kill/pkill through bash: the registry then reports the task as killed instead of failed.",
+			"For mixed targets (a local task plus processes on a device), stop the local side with bg_kill and keep adb/ssh kill commands for the remote side — never raw-kill a pid that bash_bg owns.",
 		],
 		parameters: BgKillParams,
 		executionMode: "sequential" as const,
