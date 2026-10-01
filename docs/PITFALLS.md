@@ -53,3 +53,13 @@
 **Avoid**: 提交后、push 前对**提交内容**跑一次门禁：`git stash -u && npm test && npm run typecheck && git stash pop`，或 checkout 到提交上验证；栈式多提交时逐提交验证（`git rebase -i` 的 edit 停点处跑）。
 
 **Recovery**: CI 红了先比对 `git diff <CI上的提交> --stat` 与工作树；缺失文件补回对应栈层（rebase edit + amend），force-push 前逐提交重验。
+
+### P5: Windows+WSL 下给 spawn("bash") 传 fd 或 Windows 路径，输出与退出码静默全断
+
+**Trap**: detached 任务在 Windows 上把 Node `openSync` 的 fd 传给 `spawn("bash", …)` 的 stdio，并把 `C:\…` 路径写进 wrapper 的 printf 重定向——这里的 bash 实为 WSL bash.exe 中继（#15）。
+
+**Why**: WSL 不翻译继承的 Windows 文件句柄（子进程 fd/1 落在控制台 pts，log 恒 0 字节）；`C:\…` 在 WSL 里不是合法路径（status 文件永不写 → "no exit" → 领养拿不到退出码）。非 detach 的管道 stdio 不受影响。
+
+**Avoid**: 跨 WSL 边界只传**文本**不传句柄：路径经 `toWslPath` 译成 `/mnt/<drive>/…`，让 shell 自己 `>>`/`>` 重定向，stdio 全 ignore；不可翻译的路径（UNC 等）在创建任何工件前 fail-fast。
+
+**Recovery**: 已断输出的 detached 任务无法补录，`bg_kill` 后重跑；孤儿工件在 tmpdir 的 `pi-bg-shell/` 会话子目录里，可手工清理。

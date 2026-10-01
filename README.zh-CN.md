@@ -57,6 +57,8 @@ Notify:  Background task #1 pattern match (on_pattern "ROOTED", match #1, runnin
 
 `bg_kill` 对脱离任务发整进程组信号。
 
+Windows 上 `bash` 通常是 WSL 中继，继承的 Windows 文件句柄跨不了这个边界——脱离任务在该平台改走 shell 自重定向（路径译为 `/mnt/<drive>/…`，`( cmd ) >> OUT 2>> ERR`），输出文件与退出码仍落在 `bg_status` 和下会话领养预期的位置。
+
 ## 用户界面
 
 任务运行期间，编辑器上方常驻一行状态条（fleet 风格）：
