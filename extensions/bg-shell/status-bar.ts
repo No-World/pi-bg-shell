@@ -24,7 +24,8 @@ export const BG_STATUS_WIDGET_KEY = "bg-shell-status";
 /** Task cards shown before collapsing into "… +N more"; caps the widget height. */
 const MAX_TASKS_SHOWN = 6;
 
-/** Repaint cadence: elapsed ticking + spinner rotation (pi-subagents uses 500 ms). */
+/** Repaint cadence — deliberately identical to pi-subagents' fleet-status
+ * REFRESH_MS (500 ms) so widgets animate at the same beat when both run. */
 export const STATUS_REFRESH_MS = 500;
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -237,6 +238,9 @@ export class BgStatusBar {
 	private readonly getOutput: OutputProvider;
 	private handle: unknown;
 	private tick = 0;
+	/** State frozen at the last tick — render() draws only from this frame so
+	 * spinner, elapsed, and output advance in lockstep, never on foreign repaints. */
+	private frame: WidgetState | undefined;
 	private registered = false;
 	private tui: WidgetTui | undefined;
 	private theme: StatusTheme | undefined;
@@ -315,6 +319,7 @@ export class BgStatusBar {
 				});
 			}
 		}
+		this.frame = { running: this.running, now: Date.now(), tick: this.tick, activity: this.activity };
 		this.ensureRegistered();
 		this.tui?.requestRender();
 	}
@@ -329,7 +334,7 @@ export class BgStatusBar {
 				return {
 					render: (width: number) =>
 						formatStatusBarLines(
-							{ running: this.running, now: Date.now(), tick: this.tick, activity: this.activity },
+							this.frame ?? { running: this.running, now: 0, tick: 0, activity: this.activity },
 							this.theme ?? theme,
 							width,
 						) ?? [],

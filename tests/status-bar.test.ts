@@ -304,7 +304,21 @@ test("BgStatusBar feeds output tails into the activity line", () => {
 	assert.match(subline, /heartbeat #113/); // last line advanced
 });
 
-test("BgStatusBar removes the widget and stops the ticker when tasks drain", () => {
+test("BgStatusBar animates strictly on the tick — foreign repaints draw the same frame", () => {
+	const timer = new FakeTimer();
+	const ui = new FakeUi();
+	const bar = new BgStatusBar({ timer });
+	bar.bindUi(ui);
+	bar.refresh([snapshot({ startedAt: Date.now() - 65_000 })]);
+	const first = ui.render();
+	const foreign = ui.render(); // pi repainted for unrelated reasons
+	assert.deepEqual(foreign, first); // same frozen frame: no spinner/elapsed drift
+	timer.fire();
+	const next = ui.render();
+	assert.notDeepEqual(next, first); // only the 500 ms tick advances the frame
+});
+
+	test("BgStatusBar removes the widget and stops the ticker when tasks drain", () => {
 	const timer = new FakeTimer();
 	const ui = new FakeUi();
 	const bar = new BgStatusBar({ timer });
