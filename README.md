@@ -65,22 +65,22 @@ While tasks run, a card-style status widget sits above the input editor and repa
 
 ```
 bg · background
-   ⠸ #1 chatty-ticker · running · 1m 12s
+   ⠸ #1 chatty-ticker · running · 1m 12s / 10m
      cmd: for i in $(seq 150); do echo …
      ⎿  ↓ 18.0k · [16:52:31] chatty heartbeat #93 …
-   ⠋ #2 quiet-soak · running · 4m 2s
+   ⠋ #2 quiet-soak · running · 4m 2s / 10m
      cmd: sleep 300
  2 running · /bg panel
 ```
 
-The header and task labels render plain; chrome (`· running ·`, `cmd:`, `⎿`) is dim, stats are muted, and commands plus live output lines use the toolOutput color. Every line is truncated to the terminal width. More than six running tasks collapse into `… +N more`; the widget (and its ticker) removes itself when the last task ends.
+The header and task labels render plain; chrome (`· running ·`, `cmd:`, `⎿`) is dim, stats are muted, and commands plus live output lines use the toolOutput color. Every line is truncated to the terminal width. More than six running tasks collapse into `… +N more`; the widget (and its ticker) removes itself when the last task ends. Running rows append the timeout budget after the elapsed time (`1m 12s / 10m`) whenever one is armed — `timeout_sec: 0` and detached tasks (no default timeout) show none.
 
 All information views open an overlay panel — never dump into the transcript:
 
 | Command | What opens |
 |---------|------------|
 | `/bg` | Overlay panel: task list, `↑↓` select, `Enter` detail, `K` kill, `r` refresh, `q`/`esc` close |
-| `/bg <id>` | The panel focused on one task's detail (status, exit code, command, output tails, spill path) |
+| `/bg <id>` | The panel focused on one task's detail (status, exit code, command, running timeout with countdown, output tails, spill path) |
 | `/bg tail <id> [bytes]` | Same detail view with a larger output tail (default 4096 bytes) |
 | `/bg log <id>` | Same detail view; truncated tasks show their full-output spill path |
 | `/bg kill <id> [signal]` | Terminates a task (default `SIGTERM`) with a toast ack |

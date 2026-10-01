@@ -65,22 +65,22 @@ Windows 上 `bash` 通常是 WSL 中继，继承的 Windows 文件句柄跨不�
 
 ```
 bg · background
-   ⠸ #1 chatty-ticker · running · 1m 12s
+   ⠸ #1 chatty-ticker · running · 1m 12s / 10m
      cmd: for i in $(seq 150); do echo …
      ⎿  ↓ 18.0k · [16:52:31] chatty heartbeat #93 …
-   ⠋ #2 quiet-soak · running · 4m 2s
+   ⠋ #2 quiet-soak · running · 4m 2s / 10m
      cmd: sleep 300
  2 running · /bg panel
 ```
 
-表头与任务名保持白色；装饰（`· running ·`、`cmd:`、`⎿`）dim，统计 muted，命令与实时输出行 toolOutput 色；每行按终端宽度截断。运行中任务超过六个折叠为 `… +N more`；最后一个任务结束后 widget 连同 ticker 一起消失。
+表头与任务名保持白色；装饰（`· running ·`、`cmd:`、`⎿`）dim，统计 muted，命令与实时输出行 toolOutput 色；每行按终端宽度截断。运行中任务超过六个折叠为 `… +N more`；最后一个任务结束后 widget 连同 ticker 一起消失。运行行在装了超时时于已跑时长后追加超时预算（`1m 12s / 10m`）——`timeout_sec: 0` 与 detached 任务（无默认超时）不显示。
 
 所有查看类指令一律拉起弹窗面板，不往正文窗口灌内容：
 
 | 指令 | 行为 |
 |------|------|
 | `/bg` | 弹窗面板：任务列表，`↑↓` 选择、`Enter` 详情、`K` 终止、`r` 刷新、`q`/`esc` 关闭 |
-| `/bg <id>` | 直接打开该任务详情（状态、退出码、命令、输出尾部、溢写路径） |
+| `/bg <id>` | 直接打开该任务详情（状态、退出码、命令、运行中超时预算与剩余倒计时、输出尾部、溢写路径） |
 | `/bg tail <id> [bytes]` | 同详情视图，可指定更大的尾部字节数（默认 4096） |
 | `/bg log <id>` | 同详情视图；被截断的任务会展示全量输出的溢写文件路径 |
 | `/bg kill <id> [signal]` | 终止任务（默认 `SIGTERM`），toast 确认 |

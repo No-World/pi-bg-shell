@@ -104,6 +104,18 @@ export function formatElapsed(totalSeconds: number): string {
 	return `${Math.floor(minutes / 60)}h ${(minutes % 60)}m ${seconds}s`;
 }
 
+/** Timeout budget for the running row ("45s" / "5m" / "4m 30s" / "2h 5m"). */
+export function formatBudget(totalMs: number): string {
+	const totalSeconds = Math.max(0, Math.floor(totalMs / 1000));
+	if (totalSeconds < 60) return `${totalSeconds}s`;
+	const minutes = Math.floor(totalSeconds / 60);
+	const seconds = totalSeconds % 60;
+	if (minutes < 60) return seconds === 0 ? `${minutes}m` : `${minutes}m ${seconds}s`;
+	const hours = Math.floor(minutes / 60);
+	const remMinutes = minutes % 60;
+	return remMinutes === 0 ? `${hours}h` : `${hours}h ${remMinutes}m`;
+}
+
 function formatBytes(bytes: number): string {
 	if (bytes < 1024) return `${bytes} B`;
 	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}k`;
@@ -135,7 +147,7 @@ export interface WidgetState {
  *
  * ```
  * bg · background
- *    ⠸ chatty-ticker · running · 1m 12s
+ *    ⠸ chatty-ticker · running · 1m 12s / 10m
  *      cmd: for i in $(seq 150); do echo …
  *      ⎿  ↓ 18.4k (+2.1k) · [16:52:31] chatty heartbeat #93 …
  *    ⠋ quiet-soak · running · 4m 2s
@@ -158,10 +170,13 @@ export function formatStatusBarLines(
 	shown.forEach((task, index) => {
 		const spinner = SPINNER_FRAMES[(tick + index) % SPINNER_FRAMES.length];
 		const seconds = Math.max(0, Math.floor((now - task.startedAt) / 1000));
+		// Budget rides the elapsed segment ("1m 12s / 10m"); timeoutMs 0 (detached
+		// default, explicit disable) means no limit and shows nothing.
+		const budget = task.timeoutMs > 0 ? theme.fg("muted" as never, ` / ${formatBudget(task.timeoutMs)}`) : "";
 		const row =
 			`   ${spinner} #${task.id} ${task.label}` +
 			`${theme.fg("dim" as never, " · running · ")}` +
-			`${theme.fg("muted" as never, formatElapsed(seconds))}`;
+			`${theme.fg("muted" as never, formatElapsed(seconds))}${budget}`;
 		lines.push(truncateStyled(row, width));
 
 		const cmd = truncateStyled(
