@@ -12,6 +12,7 @@
  * ui.custom() factory satisfies PanelTheme structurally.
  */
 
+import { matchesKey } from "@earendil-works/pi-tui";
 import type { TaskOutput, TaskRegistry, TaskSnapshot } from "./tasks.ts";
 import { formatShort } from "./status-bar.ts";
 
@@ -48,12 +49,18 @@ interface InputKey {
 	char: string;
 }
 
-/** Raw terminal data → logical key. Exported for tests. */
+/** Raw terminal data → logical key. Exported for tests.
+ *
+ * Special keys go through pi-tui's matchesKey, which understands both legacy
+ * sequences ("\x1b", "\x1b[A", "\r") and the Kitty keyboard protocol
+ * ("\x1b[27u", "\x1b[1;3A", …) — raw byte equality missed Kitty-encoded
+ * Esc, making the key dead on Kitty-protocol terminals.
+ */
 export function parsePanelInput(data: string): InputKey {
-	if (data === "\x1b[A" || data === "k") return { name: "up", char: data };
-	if (data === "\x1b[B" || data === "j") return { name: "down", char: data };
-	if (data === "\r" || data === "\n") return { name: "enter", char: data };
-	if (data === "\x1b") return { name: "escape", char: data };
+	if (data === "k" || matchesKey(data, "up")) return { name: "up", char: data };
+	if (data === "j" || matchesKey(data, "down")) return { name: "down", char: data };
+	if (matchesKey(data, "enter")) return { name: "enter", char: data };
+	if (matchesKey(data, "escape")) return { name: "escape", char: data };
 	if (data === "q") return { name: "q", char: data };
 	if (data === "K") return { name: "K", char: data };
 	if (data === "r") return { name: "r", char: data };

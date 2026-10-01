@@ -32,6 +32,14 @@ test("parsePanelInput maps raw sequences and vim-style keys", () => {
 	assert.equal(parsePanelInput("x").name, "other");
 });
 
+test("parsePanelInput understands Kitty keyboard protocol encodings", () => {
+	// Kitty terminals encode Esc as CSI 27u — raw "\x1b" never arrives.
+	assert.equal(parsePanelInput("\x1b[27u").name, "escape");
+	assert.equal(parsePanelInput("\x1b[27;1u").name, "escape");
+	assert.equal(parsePanelInput("\x1b[13u").name, "enter");
+	assert.equal(parsePanelInput("\x1b[1;3A").name, "other", "alt+up is not bare up");
+});
+
 test("panel list renders tasks with status and selection marker", async () => {
 	const registry = new TaskRegistry({ killGraceMs: 100 });
 	registry.start({ command: "echo alpha", label: "alpha job", timeoutMs: 0 });
