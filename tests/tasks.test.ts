@@ -327,10 +327,12 @@ test("detached on_pattern fires for output written before the first poll", async
 	registry.dispose();
 });
 
-test("win32 detached spawns a host-written wrapper script, not -c argv", { skip: process.platform !== "win32" }, () => {
-	// Regression (PITFALLS P6): the wrapper used to travel as `bash -c <argv>`;
-	// the WSL relay re-quotes arguments through its default shell, expanding
-	// the double-quoted "$?" to a literal 0 — every detached exit code read 0.
+test("win32 detached spawns the relay through a hidden wscript launcher", { skip: process.platform !== "win32" }, () => {
+	// Regression (PITFALLS P6 + P8): the wrapper travels as a host-side file
+	// (never -c argv — the relay expands the double-quoted "$?" to 0), and the
+	// spawn itself goes through wscript.exe: detached (DETACHED_PROCESS)
+	// beats windowsHide (CREATE_NO_WINDOW) for console children, so only a
+	// GUI-subsystem launcher keeps the relay popup-free.
 	const dir = tempDir("det wrapper-file");
 	let args: string[] | undefined;
 	let opts: Record<string, unknown> | undefined;
@@ -347,25 +349,57 @@ test("win32 detached spawns a host-written wrapper script, not -c argv", { skip:
 	const registry = freshRegistry({ detachedDirPath: dir, spawnFn: fakeSpawn });
 	registry.start({ command: "exit 42", detach: true, timeoutMs: 0 });
 	assert.ok(args !== undefined, "spawn was called");
-	assert.equal(args.length, 1, "argv is only the wrapper path — no -c string, no $?");
-	const wslPath = args[0] as string;
-	assert.match(wslPath, /^\/mnt\/[a-z]\//, "path is WSL-translated");
-	assert.ok(!wslPath.includes("$"), "no shell metacharacters cross the relay argv");
+	assert.equal(args[0], "//B");
+	assert.equal(args[1], "//Nologo");
+	const launcherPath = args[2] as string;
+	assert.ok(/\.launcher\.vbs$/.test(launcherPath), "argv points at the launcher");
+	assert.ok(!JSON.stringify(args).includes("$"), "no shell metacharacters cross argv");
 	assert.equal(opts?.detached, true);
 	assert.equal(opts?.stdio, "ignore");
-	assert.equal(opts?.windowsHide, true, "the relay console must stay hidden");
-	// The wrapper content lives in a host-side file (0600, exclusive)…
-	const drive = /^\/mnt\/([a-z])\/(.*)$/.exec(wslPath);
+	assert.equal(opts?.windowsHide, true);
+	// The launcher starts the relay hidden and waits for it.
+	const launcher = readFileSync(launcherPath, "utf8");
+	const run = /shell\.Run "bash " & Chr\(34\) & "(.*?)" & Chr\(34\), 0, True/.exec(launcher);
+	assert.ok(run !== null, "launcher runs bash hidden and waits");
+	assert.match(run[1]!, /^\/mnt\/[a-z]\//, "launcher targets the WSL wrapper path");
+	// The wrapper content keeps "$?" out of the relay's argv (P6).
+	const drive = /^\/mnt\/([a-z])\/(.*)$/.exec(run[1]!);
 	assert.ok(drive !== null);
 	const wrapperPath = `${drive[1]!.toUpperCase()}:\\${drive[2]!.replace(/\//g, "\\")}`;
 	const wrapper = readFileSync(wrapperPath, "utf8");
 	assert.ok(wrapper.includes(`printf '%s\\n' "$?"`), "the exit-code printf survives only inside the file");
 	assert.ok(wrapper.includes("( exit 42"));
-	// …and the manifest records it so adoption-side cleanup can remove it.
+	// Both artifacts are recorded for adoption-side cleanup.
 	const manifestName = readdirSync(dirname(wrapperPath)).find((name) => name.endsWith(".json"));
 	assert.ok(manifestName !== undefined);
 	const manifest = JSON.parse(readFileSync(join(dirname(wrapperPath), manifestName), "utf8"));
 	assert.equal(manifest.wrapperPath, wrapperPath);
+	assert.equal(manifest.launcherPath, launcherPath);
+	registry.dispose();
+});
+
+test("win32 kill routes through a hidden taskkill /t /f on the pid", { skip: process.platform !== "win32" }, () => {
+	// Node's kill only terminates the direct bash.exe on Windows, orphaning
+	// the WSL side; POSIX process groups do not exist there either. The kill
+	// path must therefore spawn taskkill /t (tree) — itself hidden.
+	const calls: Array<{ cmd: string; args: string[]; opts: Record<string, unknown> }> = [];
+	const fakeChild = {
+		pid: 4242,
+		unref: (): void => {},
+		on: (): unknown => fakeChild,
+	};
+	const fakeSpawn = ((cmd: string, argv: string[], options: object) => {
+		calls.push({ cmd, args: argv, opts: options as Record<string, unknown> });
+		return fakeChild;
+	}) as unknown as typeof spawnType;
+	const registry = freshRegistry({ spawnFn: fakeSpawn });
+	const snapshot = registry.start({ command: "sleep 30", timeoutMs: 0 });
+	registry.kill(snapshot.id, "SIGTERM");
+	const killer = calls.find((call) => call.cmd === "taskkill");
+	assert.ok(killer !== undefined, "taskkill spawned");
+	assert.deepEqual(killer.args, ["/pid", "4242", "/t", "/f"], "tree kill, forceful");
+	assert.equal(killer.opts.windowsHide, true, "the killer itself must stay hidden");
+	assert.equal(killer.opts.stdio, "ignore");
 	registry.dispose();
 });
 
@@ -414,11 +448,11 @@ test("detached tasks that died before adoption register their outcome silently",
 	second.dispose();
 });
 
-test("killing a detached task signals the process group", { skip: "process-group kill is POSIX-only on Windows+WSL (ADR-0006 known gap)" }, async () => {
+test("killing a detached task terminates the whole relay tree on Windows (group on POSIX)", async () => {
 	const registry = freshRegistry({ detachedDirPath: tempDir("det kill") });
 	const snapshot = registry.start({ command: "sleep 30", detach: true });
 	registry.kill(snapshot.id, "SIGTERM");
-	await waitFor(() => registry.status(snapshot.id)[0].status !== "running");
+	await waitFor(() => registry.status(snapshot.id)[0].status !== "running", 15_000, 20);
 	assert.equal(registry.status(snapshot.id)[0].status, "killed");
 	registry.dispose();
 });

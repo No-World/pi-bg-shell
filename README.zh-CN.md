@@ -57,7 +57,7 @@ Notify:  Background task #1 pattern match (on_pattern "ROOTED", match #1, runnin
 
 `bg_kill` 对脱离任务发整进程组信号。
 
-Windows 上 `bash` 通常是 WSL 中继，继承的 Windows 文件句柄跨不了这个边界——脱离任务在该平台改走 shell 自重定向（路径译为 `/mnt/<drive>/…`，`( cmd ) >> OUT 2>> ERR`），输出文件与退出码仍落在 `bg_status` 和下会话领养预期的位置。包装层本身以宿主侧脚本文件传递（`bash <file>`，不经 `-c` argv），退出码不会被 WSL 中继的参数重引号展开成 0；所有 spawn 都带 `windowsHide`，中继不会蹦出控制台窗口。自有脱离任务的 `on_pattern` 从第 0 字节起监视——启动早期的 milestone 同样会唤醒会话（领养任务另有全量回放）。任务池按 pi 进程隔离：清单记录属主进程，并存的 pi 进程不会碰属主存活的任务，只领养属主已消失的孤儿。
+Windows 上 `bash` 通常是 WSL 中继，继承的 Windows 文件句柄跨不了这个边界——脱离任务在该平台改走 shell 自重定向（路径译为 `/mnt/<drive>/…`，`( cmd ) >> OUT 2>> ERR`），输出文件与退出码仍落在 `bg_status` 和下会话领养预期的位置。包装层本身以宿主侧脚本文件传递（`bash <file>`，不经 `-c` argv），退出码不会被 WSL 中继的参数重引号展开成 0。Windows 上 detached 中继改经 GUI 子系统的 wscript 启动器拉起——仅靠 `detached`+`windowsHide` 仍会弹控制台——因此启动零弹窗，且任务不再被「关闭终端窗口」连带杀死；`bg_kill` 在 Windows 上用 `taskkill /t /f` 整树终止（跨 WSL 边界没有 POSIX 信号语义）。自有脱离任务的 `on_pattern` 从第 0 字节起监视——启动早期的 milestone 同样会唤醒会话（领养任务另有全量回放）。任务池按 pi 进程隔离：清单记录属主进程，并存的 pi 进程不会碰属主存活的任务，只领养属主已消失的孤儿。
 
 ## 用户界面
 

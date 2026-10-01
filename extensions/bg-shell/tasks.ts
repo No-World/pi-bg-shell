@@ -305,6 +305,8 @@ export interface DetachedManifest {
 	statusPath: string;
 	/** Windows+WSL only: host-written wrapper script — keeps "$?" out of argv (PITFALLS P6). */
 	wrapperPath?: string;
+	/** Windows+WSL only: wscript launcher — the only popup-free detached spawn (PITFALLS P8). */
+	launcherPath?: string;
 	/** Owning pi process; a live foreign owner keeps its pool private (ADR-0006). */
 	ownerPid?: number;
 	pattern: { literal: string; all: boolean; fired: boolean } | undefined;
@@ -372,6 +374,21 @@ export function buildWslDetachedWrapper(
 	);
 }
 
+/**
+ * Windows+WSL launcher script (VBScript): wscript is a GUI-subsystem binary,
+ * so it never owns a console — DETACHED_PROCESS has nothing to pop a window
+ * for — and Run(..., 0, True) starts the relay hidden and waits, keeping our
+ * child handle alive for the close event. A side benefit over a detached
+ * console child: closing the hosting terminal cannot kill the tree anymore,
+ * because there is no console to receive the close event (PITFALLS P8).
+ */
+export function buildWslDetachedLauncher(wrapperWslPath: string): string {
+	return (
+		`Set shell = CreateObject("WScript.Shell")\r\n` +
+		`shell.Run "bash " & Chr(34) & "${wrapperWslPath}" & Chr(34), 0, True\r\n`
+	);
+}
+
 function statSize(path: string): number {
 	try {
 		return statSync(path).size;
@@ -427,6 +444,9 @@ function readManifest(path: string): DetachedManifest | undefined {
 			return undefined;
 		}
 		if (manifest.wrapperPath !== undefined && typeof manifest.wrapperPath !== "string") {
+			return undefined;
+		}
+		if (manifest.launcherPath !== undefined && typeof manifest.launcherPath !== "string") {
 			return undefined;
 		}
 		if (manifest.ownerPid !== undefined && typeof manifest.ownerPid !== "number") {
@@ -553,6 +573,8 @@ interface TaskInternal {
 		statusPath: string;
 		/** Windows+WSL: wrapper script; removed together with the manifest. */
 		wrapperPath?: string;
+		/** Windows+WSL: wscript launcher; removed together with the manifest. */
+		launcherPath?: string;
 		/** Held-open fd for owned detached tasks; manifest updates go through it (exclusively created, 0600). */
 		manifestFd: number | undefined;
 	} | undefined;
@@ -711,6 +733,18 @@ export class TaskRegistry {
 					closeSync(wrapperFd);
 				}
 				manifest.wrapperPath = wrapperPath;
+				// Popup-free detached spawn: windowsHide (CREATE_NO_WINDOW) loses
+				// against detached (DETACHED_PROCESS) for console children, so the
+				// bash relay must be started by a GUI-subsystem launcher instead
+				// (PITFALLS P8).
+				const launcherPath = join(ddir, `${token}.launcher.vbs`);
+				const launcherFd = openSync(launcherPath, "wx", 0o600);
+				try {
+					writeSync(launcherFd, buildWslDetachedLauncher(toWslPath(wrapperPath) as string));
+				} finally {
+					closeSync(launcherFd);
+				}
+				manifest.launcherPath = launcherPath;
 			} else {
 				outFd = openSync(stdoutPath, "wx", 0o600);
 				try {
@@ -732,6 +766,7 @@ export class TaskRegistry {
 				stderrPath,
 				statusPath,
 				wrapperPath: manifest.wrapperPath,
+				launcherPath: manifest.launcherPath,
 				manifestFd,
 			};
 		}
@@ -787,12 +822,12 @@ export class TaskRegistry {
 		try {
 			if (detach && detachedPaths && process.platform === "win32") {
 				// Paths were validated as translatable before any artifact was
-				// created, and the wrapper file was written in that same block, so
-				// the assertion is structural only. argv carries a single path —
-				// no shell metacharacters cross the relay (PITFALLS P6).
-				// windowsHide: detached console apps otherwise get their own
-				// console window, so the WSL relay would pop one up.
-				child = spawnFn("bash", [toWslPath(detachedPaths.wrapperPath as string) as string], {
+				// created, and the launcher file was written in that same block,
+				// so the assertion is structural only. wscript.exe is a
+				// GUI-subsystem binary: detached cannot give it a console, so
+				// nothing pops a window, and its Run(…, True) waits for the relay
+				// tree, keeping our close event meaningful (PITFALLS P8).
+				child = spawnFn("wscript.exe", ["//B", "//Nologo", detachedPaths.launcherPath as string], {
 					cwd,
 					env,
 					detached: true,
@@ -892,6 +927,22 @@ export class TaskRegistry {
 	}
 
 	private signalChild(task: TaskInternal, signal: NodeJS.Signals): void {
+		const pid = task.snapshot.pid ?? task.child?.pid;
+		if (pid === undefined) return;
+		if (process.platform === "win32") {
+			// Windows has no signal semantics across the WSL relay: Node's kill
+			// terminates only the direct child (leaving the WSL side orphaned)
+			// and POSIX process groups do not exist. taskkill /t walks the whole
+			// relay tree instead; /f is the same TerminateProcess Node itself
+			// would use — there is no graceful console kill to honor.
+			const spawnFn = this.options.spawnFn ?? spawn;
+			const killer = spawnFn("taskkill", ["/pid", String(pid), "/t", "/f"], {
+				stdio: "ignore",
+				windowsHide: true,
+			});
+			killer.on("error", () => undefined);
+			return;
+		}
 		try {
 			if (task.detachedPaths !== undefined && task.snapshot.pid !== undefined) {
 				// Detached children are process-group leaders (setsid); signaling
@@ -1134,6 +1185,7 @@ export class TaskRegistry {
 				stderrPath: manifest.stderrPath,
 				statusPath: manifest.statusPath,
 				wrapperPath: manifest.wrapperPath,
+				launcherPath: manifest.launcherPath,
 				manifestFd: undefined, // adopted: manifests are never rewritten in-session; fired state persists via the .fired marker
 			},
 			adopted: true,
@@ -1245,6 +1297,9 @@ export class TaskRegistry {
 			rmSync(firedMarkerPath(task.detachedPaths.manifestPath), { force: true });
 			if (task.detachedPaths.wrapperPath !== undefined) {
 				rmSync(task.detachedPaths.wrapperPath, { force: true });
+			}
+			if (task.detachedPaths.launcherPath !== undefined) {
+				rmSync(task.detachedPaths.launcherPath, { force: true });
 			}
 		} catch {
 			// Best effort only.
