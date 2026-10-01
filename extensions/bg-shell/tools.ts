@@ -38,6 +38,8 @@ const BgKillParams = Type.Object({
 
 export interface BgToolDeps {
 	registry: TaskRegistry;
+	/** Called after state changes (task started / killed) so the host can refresh UI. */
+	onChange?: () => void;
 }
 
 /** Models sometimes emit "#3" or "3" for an id field; normalize before validation. */
@@ -120,6 +122,7 @@ export function bashBgTool(deps: BgToolDeps) {
 				env: params.env,
 				label: params.label,
 			});
+			deps.onChange?.();
 			const text =
 				`Started background task #${snapshot.id} (pid ${snapshot.pid ?? "?"}): ${snapshot.label}\n` +
 				`A completion notification with the output arrives automatically on exit — continue working; do not poll.`;
@@ -206,6 +209,7 @@ export function bgKillTool(deps: BgToolDeps) {
 				};
 			}
 			deps.registry.kill(params.id, params.signal ?? "SIGTERM");
+			deps.onChange?.();
 			return {
 				content: [{ type: "text" as const, text: `Sent ${params.signal ?? "SIGTERM"} to task #${params.id} (${existing.label}).` }],
 				details: { id: params.id, signal: params.signal ?? "SIGTERM", killed: true },

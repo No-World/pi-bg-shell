@@ -22,9 +22,11 @@ interface RegisteredTool {
 function stubPi() {
 	const tools: RegisteredTool[] = [];
 	const handlers: { event: string; handler: (event: unknown) => Promise<void> | void }[] = [];
+	const commands: { name: string; handler: (args: string, ctx: unknown) => Promise<void> }[] = [];
 	return {
 		tools,
 		handlers,
+		commands,
 		registerTool(tool: Record<string, unknown>) {
 			tools.push({
 				name: String(tool.name),
@@ -34,6 +36,9 @@ function stubPi() {
 		},
 		on(event: string, handler: (event: unknown) => Promise<void> | void) {
 			handlers.push({ event, handler });
+		},
+		registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+			commands.push({ name, handler: options.handler });
 		},
 	};
 }
@@ -47,6 +52,11 @@ test("extension entry registers three tools and a quit-only shutdown handler", a
 		["bash_bg", "bg_kill", "bg_status"],
 	);
 	assert.ok(pi.tools.every((tool) => tool.hasExecute));
+	assert.deepEqual(
+		pi.commands.map((command) => command.name),
+		["bg"],
+		"the /bg command registers alongside the tools",
+	);
 	const shutdown = pi.handlers.find((handler) => handler.event === "session_shutdown");
 	assert.ok(shutdown !== undefined, "session_shutdown handler registered");
 	// quit must dispose the shared registry (fresh one — keep this test hermetic

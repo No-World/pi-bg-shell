@@ -25,6 +25,26 @@ Pi 内置的 `bash` 工具会阻塞整个 agent 轮次直到命令结束——�
 
 完成通知以 `bg-shell-notify` 消息经 `pi.sendMessage({ triggerTurn: true })` 送进对话——与官方 file-trigger 示例、pi-subagents 的完成通知同一条唤醒原语。100 ms 窗口内的并发完成合并为一条消息，fan-out 不会冲垮会话。默认墙钟上限每任务 10 分钟（`timeout_sec` 可覆盖；`0` 关闭）。
 
+## 用户界面
+
+任务运行期间，编辑器上方常驻一行状态条（fleet 风格）：
+
+```
+▶ bg 2 running: #1 npm test (1m12s) · #2 vite dev (0m31s) — /bg panel
+```
+
+所有查看类指令一律拉起弹窗面板，不往正文窗口灌内容：
+
+| 指令 | 行为 |
+|------|------|
+| `/bg` | 弹窗面板：任务列表，`↑↓` 选择、`Enter` 详情、`K` 终止、`r` 刷新、`q` 关闭 |
+| `/bg <id>` | 直接打开该任务详情（状态、退出码、命令、输出尾部、溢写路径） |
+| `/bg tail <id> [bytes]` | 同详情视图，可指定更大的尾部字节数（默认 4096） |
+| `/bg log <id>` | 同详情视图；被截断的任务会展示全量输出的溢写文件路径 |
+| `/bg kill <id> [signal]` | 终止任务（默认 `SIGTERM`），toast 确认 |
+
+Tab 补全提供子命令与任务 id。无界面模式（RPC/JSON/print）退化为 notify 摘要。
+
 ## 安装
 
 ```bash

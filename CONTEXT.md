@@ -8,6 +8,14 @@ Pi 编码 agent 的后台 shell 任务扩展。本文档是项目的**术语表�
 `bash_bg` 启动的一条 shell 子进程及其登记信息（id、pid、状态、输出缓冲、超时）。id 是进程内单调递增整数，对话中以 `#N` 指代。
 _Avoid_: 子 agent（那是 pi-subagents 的完整 agent 会话；后台任务是裸进程）、作业/job（统一叫任务）。
 
+**任务面板**：
+`/bg` 拉起的 overlay 弹窗（列表 + 详情两视图），对齐 pi-subagents fleet 视图的交互（↑↓ 选、Enter 详情、K 杀、q 关）。所有查看类指令都落在这里，不往正文窗口回内容。
+_Avoid_: fleet 视图（那是 subagent 的词；这里是任务面板）、列表命令（面板是弹窗不是列表输出）。
+
+**状态条**：
+有任务运行时常驻编辑器上方的一行 widget（`▶ bg N running: …`），无任务自动消失；fork 自 subagent 的常驻状态栏模式。
+_Avoid_: 状态栏/footer（footer 是 pi 底栏；状态条是 editor 上方 widget）、toast（那是 notify 瞬时提示）。
+
 **任务状态**：
 五值：`running` / `completed`（退出码 0）/ `failed`（非 0 或 spawn 失败）/ `killed`（被 `bg_kill`）/ `timeout`（超时击杀）。
 _Avoid_: 成功/失败对（failed 覆盖 spawn 错误，不只是非零退出；killed 与 failed 严格区分——前者是主动终止）。
