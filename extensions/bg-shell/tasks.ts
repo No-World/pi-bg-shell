@@ -12,7 +12,7 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, mkdtempSync, openSync, rmSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -64,12 +64,20 @@ export interface TaskOutput {
  * Bounded output buffer: keeps a byte tail in memory; on first overflow,
  * dumps everything captured so far into a spill file and appends every later
  * chunk there. Spill + memory tail always reconstruct the full output.
+ *
+ * Spill files live inside a per-registry mkdtemp'd 0700 directory and are
+ * created exclusively (O_EXCL "wx") with owner-only mode 0600 — no window
+ * for symlink/pre-creation games in the shared tmpdir. If the spill cannot
+ * be created or written (disk full, tmp gone), memory falls back to a bounded
+ * tail and `truncated` still reports data loss.
  */
 export class OutputBuffer {
 	private chunks: Buffer[] = [];
 	private memBytes = 0;
 	private totalBytes = 0;
 	private spill: string | undefined;
+	private spillFd: number | undefined;
+	private lossy = false;
 	private readonly maxBytes: number;
 	private readonly spillFilePath: string;
 
@@ -83,7 +91,7 @@ export class OutputBuffer {
 	}
 
 	get truncated(): boolean {
-		return this.spill !== undefined;
+		return this.spill !== undefined || this.lossy;
 	}
 
 	get spillPath(): string | undefined {
@@ -93,29 +101,44 @@ export class OutputBuffer {
 	append(chunk: Buffer): void {
 		if (chunk.length === 0) return;
 		this.totalBytes += chunk.length;
-		if (this.spill !== undefined) {
+		if (this.spillFd !== undefined) {
 			try {
-				appendFileSync(this.spill, chunk);
+				writeSync(this.spillFd, chunk);
 			} catch {
 				// Spill write failures must never kill the child pipeline;
 				// the memory tail still carries the recent output.
+				this.lossy = true;
 			}
 		}
 		this.chunks.push(chunk);
 		this.memBytes += chunk.length;
-		if (this.spill === undefined && this.memBytes > this.maxBytes) {
-			try {
-				writeFileSync(this.spillFilePath, Buffer.concat(this.chunks));
-				this.spill = this.spillFilePath;
-			} catch {
-				// No spill possible (disk full, tmp gone): keep trimming memory.
-			}
+		if (this.spillFd === undefined && this.memBytes > this.maxBytes) {
+			this.openSpill();
 		}
-		if (this.spill !== undefined) {
+		if (this.memBytes > this.maxBytes && (this.spillFd !== undefined || this.lossy)) {
 			while (this.chunks.length > 1 && this.memBytes - this.chunks[0].length >= this.maxBytes) {
 				this.memBytes -= this.chunks[0].length;
+				if (this.spillFd === undefined) this.lossy = true;
 				this.chunks.shift();
 			}
+		}
+	}
+
+	private openSpill(): void {
+		try {
+			const fd = openSync(this.spillFilePath, "wx", 0o600);
+			try {
+				writeSync(fd, Buffer.concat(this.chunks));
+			} catch (error) {
+				closeSync(fd);
+				throw error;
+			}
+			this.spillFd = fd;
+			this.spill = this.spillFilePath;
+		} catch {
+			// No spill possible (disk full, tmp gone, leftover file): fall back
+			// to a bounded lossy memory tail instead of growing unbounded.
+			this.lossy = true;
 		}
 	}
 
@@ -134,6 +157,15 @@ export class OutputBuffer {
 	}
 
 	dispose(): void {
+		if (this.spillFd !== undefined) {
+			try {
+				closeSync(this.spillFd);
+			} catch {
+				// Best effort only.
+			} finally {
+				this.spillFd = undefined;
+			}
+		}
 		if (this.spill !== undefined) {
 			try {
 				rmSync(this.spill, { force: true });
