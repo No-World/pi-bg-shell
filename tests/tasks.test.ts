@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { defaultTimeoutMsFromEnv, OutputBuffer, TaskRegistry } from "../extensions/bg-shell/tasks.ts";
+import { defaultTimeoutMsFromEnv, LineMatcher, OutputBuffer, TaskRegistry, type RunningEvent, type TaskOutput, type TaskSnapshot } from "../extensions/bg-shell/tasks.ts";
 
 function tempDir(prefix: string): string {
 	return mkdtempSync(join(tmpdir(), `pi-bg-shell-test-${prefix}-`));
@@ -189,6 +189,106 @@ test("killAll terminates every running task", async () => {
 	await waitFor(() => registry.runningCount === 0);
 	assert.equal(registry.status(one.id)[0].status, "killed");
 	assert.equal(registry.status(two.id)[0].status, "killed");
+	registry.dispose();
+});
+
+test("LineMatcher fires on completed lines across chunk splits and strips CR", () => {
+	const hits: Array<{ line: string; stream: string }> = [];
+	const matcher = new LineMatcher("ROOTED", (line, stream) => hits.push({ line, stream }));
+	matcher.feed(Buffer.from("prelude\npartial RO"), "stdout");
+	assert.equal(hits.length, 0, "no newline yet — nothing complete to match");
+	matcher.feed(Buffer.from("OTED device 3\r\n"), "stdout");
+	assert.deepEqual(hits, [{ line: "partial ROOTED device 3", stream: "stdout" }]);
+	matcher.feed(Buffer.from("noise\n"), "stderr");
+	assert.equal(hits.length, 1, "non-matching lines do not fire");
+	matcher.feed(Buffer.from("ROOTED on stderr\n"), "stderr");
+	assert.equal(hits.length, 2);
+	assert.equal(hits[1]?.stream, "stderr");
+});
+
+test("LineMatcher tests very long unterminated lines once past the cap", () => {
+	const hits: string[] = [];
+	const matcher = new LineMatcher("needle", (line) => hits.push(line));
+	matcher.feed(Buffer.from("x".repeat(70_000) + "needle"), "stdout");
+	assert.equal(hits.length, 1, "cap flush forces a mid-line test");
+	assert.ok(hits[0]!.includes("needle"));
+});
+
+test("on_pattern wakes once per task while later matches still count", async () => {
+	const registry = freshRegistry();
+	const events: RunningEvent[] = [];
+	registry.onRunningEvent = (_snapshot, _output, event) => events.push(event);
+	const snapshot = registry.start({
+		command: "echo pre; sleep 0.15; echo ROOTED one; sleep 0.15; echo ROOTED two; sleep 0.1",
+		timeoutMs: 0,
+		pattern: { literal: "ROOTED" },
+	});
+	await waitFor(() => registry.status(snapshot.id)[0].status !== "running");
+	const fired = events.filter((event) => event.kind === "pattern");
+	assert.equal(fired.length, 1, "single-shot fires exactly once");
+	assert.equal(fired[0]?.line, "ROOTED one");
+	assert.equal(registry.status(snapshot.id)[0].pattern?.matches, 2, "counting continues after the fire");
+	assert.equal(registry.status(snapshot.id)[0].status, "completed");
+	registry.dispose();
+});
+
+test("on_pattern with all fires per match under the rate limit and saturates above it", async () => {
+	const registry = freshRegistry();
+	const events: RunningEvent[] = [];
+	registry.onRunningEvent = (_snapshot, _output, event) => events.push(event);
+	const snapshot = registry.start({
+		command: "echo HIT a; sleep 0.1; echo HIT b; echo HIT c; sleep 0.1",
+		timeoutMs: 0,
+		pattern: { literal: "HIT", all: true, minFireIntervalMs: 60_000 },
+	});
+	await waitFor(() => registry.status(snapshot.id)[0].status !== "running");
+	assert.equal(events.filter((event) => event.kind === "pattern").length, 1, "log floods are rate-limited");
+	assert.equal(registry.status(snapshot.id)[0].pattern?.matches, 3);
+	registry.dispose();
+
+	const free = freshRegistry();
+	const fired: RunningEvent[] = []
+	free.onRunningEvent = (_snapshot, _output, event) => fired.push(event);
+	const second = free.start({
+		command: "echo HIT a; sleep 0.1; echo HIT b; sleep 0.1; echo HIT c; sleep 0.1",
+		timeoutMs: 0,
+		pattern: { literal: "HIT", all: true, minFireIntervalMs: 0 },
+	});
+	await waitFor(() => free.status(second.id)[0].status !== "running");
+	assert.equal(fired.filter((event) => event.kind === "pattern").length, 3, "zero interval lets every match through");
+	free.dispose();
+});
+
+test("on_pattern with stop delivers the match and then kills the task", async () => {
+	const registry = freshRegistry();
+	const events: RunningEvent[] = [];
+	registry.onRunningEvent = (_snapshot, _output, event) => events.push(event);
+	const snapshot = registry.start({
+		command: "sleep 0.2; echo DONE; sleep 30",
+		timeoutMs: 0,
+		pattern: { literal: "DONE", stop: true },
+	});
+	await waitFor(() => registry.status(snapshot.id)[0].status !== "running");
+	assert.equal(events.filter((event) => event.kind === "pattern").length, 1, "match delivered first");
+	assert.equal(events[0]?.line, "DONE");
+	assert.equal(registry.status(snapshot.id)[0].status, "killed", "task stopped via the kill path");
+	registry.dispose();
+});
+
+test("report_every delivers progress while running and stops at exit", async () => {
+	const registry = freshRegistry();
+	const events: RunningEvent[] = [];
+	registry.onRunningEvent = (_snapshot, _output, event) => events.push(event);
+	const snapshot = registry.start({ command: "sleep 1", timeoutMs: 0, reportEveryMs: 150 });
+	await waitFor(() => registry.status(snapshot.id)[0].status !== "running");
+	const reports = events.filter((event) => event.kind === "report");
+	assert.ok(reports.length >= 2, `expected >= 2 reports, got ${reports.length}`);
+	registry.dispose();
+});
+
+test("empty pattern literal is rejected", () => {
+	const registry = freshRegistry();
+	assert.throws(() => registry.start({ command: "true", pattern: { literal: "" } }), /non-empty/);
 	registry.dispose();
 });
 

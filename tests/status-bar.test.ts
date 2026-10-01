@@ -18,6 +18,8 @@ function snapshot(overrides: Partial<TaskSnapshot> = {}): TaskSnapshot {
 		finishedAt: undefined,
 		durationMs: undefined,
 		timeoutMs: 600000,
+		pattern: undefined,
+		reportEveryMs: undefined,
 		stdoutBytes: 0,
 		stderrBytes: 0,
 		stdoutTruncated: false,

@@ -25,6 +25,25 @@ Pi's built-in `bash` tool blocks the whole agent turn until the command finishes
 
 Completion is delivered as a `bg-shell-notify` message via `pi.sendMessage({ triggerTurn: true })` — the same wake primitive the official file-trigger example and pi-subagents' completion path use. Completions inside a 100 ms window merge into a single message, so a fan-out of tasks cannot stampede the session. Default wall-clock limit is 10 minutes per task (`timeout_sec` overrides; `0` disables).
 
+### Wakes while a task is still running
+
+Exit is not the only delivery moment anymore (ADR-0005):
+
+- **`on_pattern`** — a literal substring watched line-by-line (grep semantics). The first matching line wakes the agent with the matched line plus the output tail; the task **keeps running**. `on_pattern_all` wakes on every match (rate-limited), `on_pattern_stop` stops the task right after delivering the match. `bg_status` shows `running·matched×N` as a sub-state while it runs.
+- **`report_every_sec`** — while the task runs, a progress report (elapsed time + output tail) arrives every N seconds (clamped to ≥ 5) without interrupting it.
+
+```
+Agent:   bash_bg {command: "./day_runner.sh", timeout_sec: 0,
+         on_pattern: "ROOTED", report_every_sec: 600}
+Notify:  Background task #4 still running (600.2s elapsed, report every 600s): ./day_runner.sh …
+Notify:  Background task #4 pattern match (on_pattern "ROOTED", match #1, running 1412.8s): ./day_runner.sh
+         --- matched line (stdout) ---
+         ROOTED device 3 ready
+         …
+```
+
+Both are delivery-timing controls, not orchestration: what to do next stays with the woken agent in the conversation.
+
 ## User surface
 
 While tasks run, a one-line status widget sits above the editor (the fleet-style bar):

@@ -8,7 +8,7 @@
  * fan-out of tasks cannot stampede the session (ADR-0003).
  */
 
-import type { TaskOutput, TaskSnapshot } from "./tasks.ts";
+import type { RunningEvent, TaskOutput, TaskSnapshot } from "./tasks.ts";
 
 export interface NotifyMessage {
 	customType: string;
@@ -48,8 +48,20 @@ interface FinishedTask {
 	output: TaskOutput;
 }
 
+/** One queued running-task event (ADR-0005). */
+export interface QueueEntry {
+	snapshot: TaskSnapshot;
+	output: TaskOutput;
+	event: RunningEvent;
+}
+
+type PendingItem = { kind: "exit"; task: FinishedTask } | { kind: "running"; item: QueueEntry };
+
+/** Anything formattable: an exit, or a running event with its payload. */
+type DeliveryEntry = { snapshot: TaskSnapshot; output: TaskOutput; event: RunningEvent | undefined };
+
 export class CompletionNotifier {
-	private pending: FinishedTask[] = [];
+	private pending: PendingItem[] = [];
 	private timer: ReturnType<typeof setTimeout> | undefined;
 	private retryTimer: ReturnType<typeof setTimeout> | undefined;
 	private readonly options: CompletionNotifierOptions;
@@ -77,7 +89,18 @@ export class CompletionNotifier {
 	/** Queue one finished task; flushes after the debounce window. */
 	push(snapshot: TaskSnapshot, output: TaskOutput): void {
 		if (snapshot.status === "running") return;
-		this.pending.push({ snapshot, output });
+		this.pending.push({ kind: "exit", task: { snapshot, output } });
+		this.scheduleFlush();
+	}
+
+	/** Queue one running-task event (pattern match / progress report). */
+	pushEvent(snapshot: TaskSnapshot, output: TaskOutput, event: RunningEvent): void {
+		if (snapshot.status !== "running") return;
+		this.pending.push({ kind: "running", item: { snapshot, output, event } });
+		this.scheduleFlush();
+	}
+
+	private scheduleFlush(): void {
 		if (this.timer === undefined) {
 			this.timer = setTimeout(() => {
 				this.timer = undefined;
@@ -103,11 +126,16 @@ export class CompletionNotifier {
 		const batch = this.pending;
 		this.pending = [];
 		if (batch.length === 0) return;
-		const raw = batch.length === 1 ? this.formatSingle(batch[0]) : this.formatGrouped(batch);
+		const entries: DeliveryEntry[] = batch.map((item) =>
+			item.kind === "exit"
+				? { snapshot: item.task.snapshot, output: item.task.output, event: undefined }
+				: { snapshot: item.item.snapshot, output: item.item.output, event: item.item.event },
+		);
+		const raw = entries.length === 1 ? this.formatSingle(entries[0]) : this.formatGrouped(entries);
 		// The follow-up hint is appended after truncation so it always survives —
 		// it is the strongest in-context steer toward bg_status/bg_kill.
 		const content =
-			`${this.truncateForModel(raw)}\n(bg_status {"id": ${batch[0].snapshot.id}} fetches more output; bg_status lists all tasks; bg_kill {"id": N} stops one)`;
+			`${this.truncateForModel(raw)}\n(bg_status {"id": ${entries[0].snapshot.id}} fetches more output; bg_status lists all tasks; bg_kill {"id": N} stops one)`;
 		try {
 			await this.options.sendMessage(
 				{ customType: "bg-shell-notify", content, display: true, details: undefined },
@@ -128,23 +156,56 @@ export class CompletionNotifier {
 		}
 	}
 
-	formatSingle(task: FinishedTask): string {
-		return `${this.headerLine(task.snapshot)}\n${this.taskOutput(task)}`;
+	formatSingle(entry: DeliveryEntry): string {
+		if (entry.event !== undefined) {
+			return `${this.eventHeader(entry)}\n${this.eventBody(entry)}${this.taskOutput(entry)}`;
+		}
+		return `${this.headerLine(entry.snapshot)}\n${this.taskOutput(entry)}`;
 	}
 
-	formatGrouped(tasks: FinishedTask[]): string {
-		const lines = tasks.map((task) => `- ${this.headerLine(task.snapshot)}`);
-		const bodies = tasks.map((task) => `=== ${this.headerLine(task.snapshot)} ===\n${this.taskOutput(task)}`);
-		return `${tasks.length} background tasks finished:\n${lines.join("\n")}\n\n${bodies.join("\n")}`;
+	formatGrouped(entries: DeliveryEntry[]): string {
+		const exits = entries.filter((entry) => entry.event === undefined);
+		const lead =
+			exits.length === entries.length
+				? `${entries.length} background tasks finished:`
+				: `${entries.length} background task events:`;
+		const lines = entries.map((entry) => `- ${entry.event !== undefined ? this.eventHeader(entry) : this.headerLine(entry.snapshot)}`);
+		const bodies = entries.map(
+			(entry) => `=== ${entry.event !== undefined ? this.eventHeader(entry) : this.headerLine(entry.snapshot)} ===\n${entry.event !== undefined ? this.eventBody(entry) : ""}${this.taskOutput(entry)}`,
+		);
+		return `${lead}\n${lines.join("\n")}\n\n${bodies.join("\n")}`;
 	}
 
 	private headerLine(task: TaskSnapshot): string {
 		const exit = task.exitCode !== null ? `exit ${task.exitCode}` : task.signal ? `signal ${task.signal}` : "no exit";
 		const duration = task.durationMs !== undefined ? `${(task.durationMs / 1000).toFixed(1)}s` : "?";
-		return `Background task #${task.id} ${STATUS_VERB[task.status]} (${exit}, ${duration}): ${task.label}`;
+		const pattern = task.pattern !== undefined && task.pattern.matches > 0 ? `, on_pattern ×${task.pattern.matches}` : "";
+		return `Background task #${task.id} ${STATUS_VERB[task.status]} (${exit}, ${duration}${pattern}): ${task.label}`;
 	}
 
-	private taskOutput(task: FinishedTask): string {
+	private eventHeader(entry: DeliveryEntry): string {
+		const task = entry.snapshot;
+		const event = entry.event;
+		if (event === undefined) return this.headerLine(task);
+		const elapsed = `${Math.max(0, (Date.now() - task.startedAt) / 1000).toFixed(1)}s`;
+		if (event.kind === "pattern") {
+			const count = event.matches !== undefined ? `, match #${event.matches}` : "";
+			return `Background task #${task.id} pattern match (on_pattern "${task.pattern?.literal ?? ""}"${count}, running ${elapsed}): ${task.label}`;
+		}
+		const every = task.reportEveryMs !== undefined ? `, report every ${Math.round(task.reportEveryMs / 1000)}s` : "";
+		return `Background task #${task.id} still running (${elapsed} elapsed${every}): ${task.label}`;
+	}
+
+	private eventBody(entry: DeliveryEntry): string {
+		const event = entry.event;
+		if (event?.kind === "pattern") {
+			const line = event.line ?? "";
+			return `--- matched line (${event.stream ?? "stdout"}) ---\n${line.slice(0, 400)}\n`;
+		}
+		return "";
+	}
+
+	private taskOutput(task: { snapshot: TaskSnapshot; output: TaskOutput }): string {
 		const budget = this.maxTaskOutputChars;
 		const stdout = this.streamSection(
 			"stdout",
