@@ -35,6 +35,12 @@ export default function (pi: ExtensionAPI) {
 		notifier.push(snapshot, output);
 		statusBar.refresh(registry.status());
 	};
+	// Running-task events (on_pattern / report_every) ride the same rebinding
+	// rule as onExit: post-reload events must reach the fresh runtime (PITFALLS P1).
+	registry.onRunningEvent = (snapshot, output, event) => {
+		notifier.pushEvent(snapshot, output, event);
+		statusBar.refresh(registry.status());
+	};
 
 	const refreshStatus = () => statusBar.refresh(registry.status());
 

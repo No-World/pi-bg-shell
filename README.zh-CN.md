@@ -25,6 +25,25 @@ Pi 内置的 `bash` 工具会阻塞整个 agent 轮次直到命令结束——�
 
 完成通知以 `bg-shell-notify` 消息经 `pi.sendMessage({ triggerTurn: true })` 送进对话——与官方 file-trigger 示例、pi-subagents 的完成通知同一条唤醒原语。100 ms 窗口内的并发完成合并为一条消息，fan-out 不会冲垮会话。默认墙钟上限每任务 10 分钟（`timeout_sec` 可覆盖；`0` 关闭）。
 
+### 任务还在跑时的唤醒
+
+退出不再是唯一的交付时机（ADR-0005）：
+
+- **`on_pattern`**——字面子串、逐行匹配（grep 语义）。首次命中即唤醒 agent，附命中行与输出尾部；任务**继续运行**。`on_pattern_all` 改为每次命中都唤醒（限频），`on_pattern_stop` 在投递命中后立即停掉任务。运行中 `bg_status` 显示 `running·matched×N` 子状态。
+- **`report_every_sec`**——任务运行期间每 N 秒（钳到 ≥5）投递一份进度报告（已运行时长 + 输出尾部），不中断任务。
+
+```
+Agent:   bash_bg {command: "./day_runner.sh", timeout_sec: 0,
+         on_pattern: "ROOTED", report_every_sec: 600}
+Notify:  Background task #4 still running (600.2s elapsed, report every 600s): ./day_runner.sh …
+Notify:  Background task #4 pattern match (on_pattern "ROOTED", match #1, running 1412.8s): ./day_runner.sh
+         --- matched line (stdout) ---
+         ROOTED device 3 ready
+         …
+```
+
+两者都只控制「何时交付信息」，不是编排：被唤醒后的下一步仍由 agent 在对话里决定。
+
 ## 用户界面
 
 任务运行期间，编辑器上方常驻一行状态条（fleet 风格）：

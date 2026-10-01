@@ -73,6 +73,11 @@ function formatDuration(ms: number): string {
 	return minutes > 0 ? `${minutes}m${String(seconds).padStart(2, "0")}s` : `${seconds}s`;
 }
 
+function patternSummary(state: TaskSnapshot["pattern"]): string {
+	if (!state || state.matches === 0) return "armed, no match yet";
+	return `matched ×${state.matches}, last: ${state.lastLine.slice(0, 200)} (${state.lastStream})`;
+}
+
 function summaryLine(task: TaskSnapshot, nowMs: number): string {
 	const time =
 		task.status === "running"
@@ -187,6 +192,12 @@ export function bgStatusTool(deps: BgToolDeps) {
 						? `running for ${formatDuration(now - snapshot.startedAt)}, timeout ${formatDuration(snapshot.timeoutMs)}\n`
 						: `duration: ${snapshot.durationMs !== undefined ? formatDuration(snapshot.durationMs) : "?"}\n`) +
 					(snapshot.errorMessage !== undefined ? `error: ${snapshot.errorMessage}\n` : "") +
+					(snapshot.pattern !== undefined
+						? `on_pattern "${snapshot.pattern.literal}": ${patternSummary(snapshot.pattern)}\n`
+						: "") +
+					(snapshot.reportEveryMs !== undefined && snapshot.status === "running"
+						? `reporting every ${Math.round(snapshot.reportEveryMs / 1000)}s while running\n`
+						: "") +
 					(output
 						? `${outputBlock("stdout", output.stdoutTail, output.stdoutBytes, output.stdoutTruncated, output.stdoutSpillPath)}\n` +
 							`${outputBlock("stderr", output.stderrTail, output.stderrBytes, output.stderrTruncated, output.stderrSpillPath)}`
