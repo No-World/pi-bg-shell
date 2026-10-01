@@ -83,3 +83,13 @@
 **Avoid**: 自有 detached 任务构造时 `fileOffsets = {stdout: 0, stderr: 0}`（POSIX 文件本就独占建空、win32 由子进程后建），首询前的字节照喂 matcher。
 
 **Recovery**: `bg_status` 见 `matched×0` 且 stdout 明明有命中行即中招；重开会话走领养回放可补发一次陈旧唤醒。
+
+### P8: Windows 上 detached 必弹控制台，Node kill 杀不穿 WSL 树
+
+**Trap**: 两个独立坑同源（Windows 无信号/进程组语义）：① `spawn("bash", …, { detached: true, windowsHide: true })` 仍弹窗——detached 映射 DETACHED_PROCESS，windowsHide 映射 CREATE_NO_WINDOW，**组合时 DETACHED_PROCESS 占优**，中继 bash.exe 照拿可见自有控制台；② `bg_kill` 报「Sent SIGTERM」但 WSL 侧还活着——Node 的 kill 只 TerminateProcess 直接子进程，`kill(-pid)` 在 win32 直接报错被吞，WSL 整棵树孤儿存活。
+
+**Why**: 两个 console 标志的组合优先级不受 Node 文档约束，实测以 DETACHED_PROCESS 为准；POSIX 进程组在 Windows 没有对应物。
+
+**Avoid**: ① 弹窗：detached 控制台链必须经 **GUI 子系统启动器**中转（wscript.exe + `Run cmd, 0, True`——GUI 进程无控制台可弹，且免疫「关终端杀树」，宿主终端关闭不再波及任务）；② 杀树：`taskkill /pid <pid> /t /f`（/f 即 TerminateProcess，与 Node kill 同强度，无优雅退路可守）。
+
+**Recovery**: 已弹窗口属旧任务，结束或 `taskkill /t` 后消失；杀不死的任务手工 `taskkill /pid <pid> /t /f`。
