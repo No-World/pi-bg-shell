@@ -51,6 +51,13 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		// Capture (or re-capture after reload) the UI surface for the widget.
 		statusBar.bindUi(ctx.hasUI ? ctx.ui : undefined);
+		// Re-adopt detached survivors from previous sessions (ADR-0006):
+		// alive ones resume tracking + notifications; dead ones register silently.
+		try {
+			registry.adoptDetached();
+		} catch {
+			// Adoption is best-effort at load; bg_status still lists what landed.
+		}
 		refreshStatus();
 	});
 
