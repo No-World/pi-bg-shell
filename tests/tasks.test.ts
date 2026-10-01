@@ -292,6 +292,118 @@ test("empty pattern literal is rejected", () => {
 	registry.dispose();
 });
 
+test("detached tasks record their real exit code from the status file", async () => {
+	const registry = freshRegistry({ detachedDirPath: tempDir("det exitcode") });
+	const snapshot = registry.start({ command: "exit 7", detach: true });
+	assert.equal(snapshot.detached, true);
+	assert.equal(snapshot.timeoutMs, 0, "detach turns the default timeout off");
+	await waitFor(() => registry.status(snapshot.id)[0].status !== "running");
+	const finished = registry.status(snapshot.id)[0];
+	assert.equal(finished.status, "failed");
+	assert.equal(finished.exitCode, 7, "the wrapper's printf-recorded code, not the wrapper's own 0");
+	registry.dispose();
+});
+
+test("detached tasks survive dispose (quit) and are re-adopted by a fresh session", async () => {
+	const shared = tempDir("det adopt");
+	const first = freshRegistry({ detachedDirPath: shared });
+	const snapshot = first.start({ command: "echo booting; sleep 2", detach: true });
+	const pid = snapshot.pid;
+	assert.ok(pid !== undefined);
+	await new Promise((resolve) => setTimeout(resolve, 300)); // let the wrapper spawn + echo flush
+	first.dispose(); // quit: detached survivors keep running, files stay
+	const second = freshRegistry({ adoptPollMs: 50, detachedDirPath: shared });
+	assert.equal(second.adoptDetached(), 1);
+	const statuses = second.status();
+	assert.equal(statuses.length, 1);
+	assert.equal(statuses[0].status, "running");
+	assert.equal(statuses[0].pid, pid);
+	assert.equal(statuses[0].adopted, true);
+	assert.equal(statuses[0].detached, true);
+	assert.match(second.output(statuses[0].id)?.stdoutTail ?? "", /\S/, "output readable from the adopted file source");
+	await waitFor(() => second.status(statuses[0].id)[0].status !== "running");
+	const finished = second.status(statuses[0].id)[0];
+	assert.equal(finished.status, "completed");
+	assert.equal(finished.exitCode, 0);
+	second.dispose();
+});
+
+test("detached tasks that died before adoption register their outcome silently", async () => {
+	const shared = tempDir("det doa");
+	const first = freshRegistry({ detachedDirPath: shared });
+	const snapshot = first.start({ command: "exit 5", detach: true });
+	await waitFor(() => first.status(snapshot.id)[0].status !== "running");
+	// Simulate a crashed session: no dispose, the manifest stays on disk.
+	const second = freshRegistry({ detachedDirPath: shared });
+	const wakes: number[] = [];
+	second.onExit = (finished) => wakes.push(finished.id);
+	assert.equal(second.adoptDetached(), 0, "dead-on-arrival does not count as alive adoption");
+	const statuses = second.status();
+	assert.equal(statuses.length, 1);
+	assert.equal(statuses[0].status, "failed");
+	assert.equal(statuses[0].exitCode, 5);
+	assert.deepEqual(wakes, [], "stale deaths never wake the session");
+	second.dispose();
+});
+
+test("killing a detached task signals the process group", async () => {
+	const registry = freshRegistry({ detachedDirPath: tempDir("det kill") });
+	const snapshot = registry.start({ command: "sleep 30", detach: true });
+	registry.kill(snapshot.id, "SIGTERM");
+	await waitFor(() => registry.status(snapshot.id)[0].status !== "running");
+	assert.equal(registry.status(snapshot.id)[0].status, "killed");
+	registry.dispose();
+});
+
+test("detached tasks ignore the default timeout", async () => {
+	const registry = freshRegistry({ defaultTimeoutMs: 150, detachedDirPath: tempDir("det timeout") });
+	const snapshot = registry.start({ command: "sleep 1", detach: true });
+	await new Promise((resolve) => setTimeout(resolve, 450));
+	assert.equal(registry.status(snapshot.id)[0].status, "running", "default timeout must not kill detached tasks");
+	await waitFor(() => registry.status(snapshot.id)[0].status !== "running");
+	assert.equal(registry.status(snapshot.id)[0].status, "completed");
+	registry.dispose();
+});
+
+test("adopted detached tasks keep pattern watching alive", async () => {
+	// The first session's poll is parked (60 s) so it cannot consume the match.
+	const shared = tempDir("det live-pattern");
+	const first = freshRegistry({ adoptPollMs: 60_000, detachedDirPath: shared });
+	first.start({ command: "sleep 0.4; echo HIT; sleep 2", detach: true, pattern: { literal: "HIT" } });
+	const second = freshRegistry({ adoptPollMs: 50, detachedDirPath: shared });
+	const events: RunningEvent[] = [];
+	second.onRunningEvent = (_snapshot, _output, event) => events.push(event);
+	assert.equal(second.adoptDetached(), 1);
+	await waitFor(() => events.some((event) => event.kind === "pattern"));
+	assert.equal(events[0]?.line, "HIT");
+	const id = second.status()[0].id;
+	second.kill(id, "SIGKILL");
+	await waitFor(() => second.status(id)[0].status !== "running");
+	first.dispose();
+	second.dispose();
+});
+
+test("a pattern that fired while nobody watched is delivered once on adoption", async () => {
+	// First session crashes before the match; its 60 s poll never persists fired.
+	const shared = tempDir("det stale-pattern");
+	const first = freshRegistry({ adoptPollMs: 60_000, detachedDirPath: shared });
+	first.start({ command: "sleep 0.3; echo ROOTED; sleep 2", detach: true, pattern: { literal: "ROOTED" } });
+	await new Promise((resolve) => setTimeout(resolve, 800)); // ROOTED is now in the log file
+	const second = freshRegistry({ adoptPollMs: 50, detachedDirPath: shared });
+	const events: RunningEvent[] = [];
+	second.onRunningEvent = (_snapshot, _output, event) => events.push(event);
+	assert.equal(second.adoptDetached(), 1);
+	await waitFor(() => events.some((event) => event.kind === "pattern"));
+	assert.equal(events.filter((event) => event.kind === "pattern").length, 1, "exactly one stale delivery");
+	assert.equal(events[0]?.line, "ROOTED");
+	assert.equal(second.status()[0].pattern?.matches, 1);
+	const id = second.status()[0].id;
+	second.kill(id, "SIGKILL");
+	await waitFor(() => second.status(id)[0].status !== "running");
+	first.dispose();
+	second.dispose();
+});
+
 test("defaultTimeoutMsFromEnv parses PI_BG_SHELL_TIMEOUT_SEC with safe fallbacks", () => {
 	const fallback = 123_000;
 	assert.equal(defaultTimeoutMsFromEnv({}, fallback), fallback, "missing → fallback");

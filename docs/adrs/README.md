@@ -48,3 +48,4 @@ Date: YYYY-MM-DD
 | [0003](./0003-background-shell-wake-mechanism.md) | 后台 shell 唤醒机制：sendMessage + triggerTurn、globalThis 驻留注册表、debounce 合并 | 2026-09-30 | Accepted |
 | [0004](./0004-default-timeout-env-var.md) | 默认超时经 PI_BG_SHELL_TIMEOUT_SEC 环境变量配置 | 2026-10-02 | Accepted |
 | [0005](./0005-running-event-delivery.md) | 运行中事件投递：on_pattern 模式唤醒与 report_every 进度报告 | 2026-10-02 | Accepted |
+| [0006](./0006-detached-tasks-and-adoption.md) | 脱离任务：detached spawn + 清单领养，任务活过会话退出 | 2026-10-02 | Accepted |
