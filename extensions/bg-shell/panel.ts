@@ -162,7 +162,7 @@ export class BgPanelComponent {
 
 	render(width: number): string[] {
 		if (width < 24) {
-			return [fitLine("bg panel: q closes (needs 24+ cols)", width)];
+			return [fitLine("bg panel: q/esc closes (needs 24+ cols)", width)];
 		}
 		const body = this.view === "list" ? this.renderList() : this.renderDetail();
 		return this.frame(body, width);
@@ -262,7 +262,7 @@ export class BgPanelComponent {
 
 function helpLine(view: "list" | "detail"): string {
 	return view === "list"
-		? " ↑↓ select · enter detail · K kill · r refresh · q close"
+		? " ↑↓ select · enter detail · K kill · r refresh · q/esc close"
 		: " esc back · K kill · r refresh · q close";
 }
 
