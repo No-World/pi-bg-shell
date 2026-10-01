@@ -63,3 +63,23 @@
 **Avoid**: 跨 WSL 边界只传**文本**不传句柄：路径经 `toWslPath` 译成 `/mnt/<drive>/…`，让 shell 自己 `>>`/`>` 重定向，stdio 全 ignore；不可翻译的路径（UNC 等）在创建任何工件前 fail-fast。
 
 **Recovery**: 已断输出的 detached 任务无法补录，`bg_kill` 后重跑；孤儿工件在 tmpdir 的 `pi-bg-shell/` 会话子目录里，可手工清理。
+
+### P6: WSL 中继把 `-c` argv 里的 "$?" 提前展开，退出码恒 0
+
+**Trap**: win32 detached 任务把 wrapper（含 `printf '%s\n' "$?" > STATUS`）作为 `spawn("bash", ["-c", wrapper])` 的 argv 传给 WSL bash.exe；中继把 argv 重组进默认 shell 的命令行时给参数裹了**双引号**，`"$?"` 在外层 shell 解析时就被展开为其自身的 0——内层 bash 拿到的已是字面 `0`，status 文件永远写 0。症状酷似「包装 bash 自身恒 0 覆盖了业务码」，实为 argv 编组损坏（ps 看 bash argv 里是 `0` 而非 `$?` 即中招）。
+
+**Why**: System32\bash.exe 不是 exec 直通，它把 Windows argv 拼回命令行交给 WSL 默认 shell 解释；双引号内的 `$?` 属于外层求值。CI 在 ubuntu 上永远走不到 win32 分支，此坑只能靠 Windows 本机跑测试暴露。
+
+**Avoid**: 跨 WSL 边界的 argv 只传**无元字符的文件路径**：wrapper 落成宿主侧脚本文件（0600 独占创建，路径入清单随清理），argv 只剩 `bash /mnt/<drive>/…/wrapper.sh`，`"$?"` 全程不离开文件。
+
+**Recovery**: 已写 0 的 status 无法复原，bg_kill 后重跑；旧清单无 wrapperPath 字段，升级后首个会话领养不清理残留 wrapper（无害，tmp 清理兜底）。
+
+### P7: detached on_pattern 首询前写入的输出被惰性 offset 永久吞掉
+
+**Trap**: 自有 detached 任务的文件 offset 惰性初始化——首个轮询 tick 才定位到当时文件末尾；起跑后 ≤ adoptPollMs（默认 2s，含 WSL 桥启动）内写入的行从不进入 LineMatcher。「启动即打第一条 milestone」的 runner 表现为 pattern 整场不响、清单 fired 恒 false，酷似轮询泵没挂上（泵其实一直在跑）。
+
+**Why**: 泵只保证「从现在起」的增量；领养路径有全量回放、自有路径没有，起点没人钉在 0。
+
+**Avoid**: 自有 detached 任务构造时 `fileOffsets = {stdout: 0, stderr: 0}`（POSIX 文件本就独占建空、win32 由子进程后建），首询前的字节照喂 matcher。
+
+**Recovery**: `bg_status` 见 `matched×0` 且 stdout 明明有命中行即中招；重开会话走领养回放可补发一次陈旧唤醒。
