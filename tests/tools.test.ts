@@ -16,6 +16,8 @@ interface RegisteredTool {
 	name: string;
 	hasExecute: boolean;
 	hasPrepareArguments: boolean;
+	hasPromptSnippet: boolean;
+	guidelineCount: number;
 }
 
 /** Minimal structural stand-in for the ExtensionAPI registration surface. */
@@ -32,6 +34,8 @@ function stubPi() {
 				name: String(tool.name),
 				hasExecute: typeof tool.execute === "function",
 				hasPrepareArguments: typeof tool.prepareArguments === "function",
+				hasPromptSnippet: typeof tool.promptSnippet === "string" && tool.promptSnippet.length > 0,
+				guidelineCount: Array.isArray(tool.promptGuidelines) ? tool.promptGuidelines.length : 0,
 			});
 		},
 		on(event: string, handler: (event: unknown) => Promise<void> | void) {
@@ -52,6 +56,14 @@ test("extension entry registers three tools and a quit-only shutdown handler", a
 		["bash_bg", "bg_kill", "bg_status"],
 	);
 	assert.ok(pi.tools.every((tool) => tool.hasExecute));
+	// Tools without a promptSnippet are omitted from the system prompt's
+	// Available-tools section and the model keeps reaching for bash instead —
+	// this guards the visibility fix for all three tools.
+	assert.ok(
+		pi.tools.every((tool) => tool.hasPromptSnippet),
+		"every bg-shell tool must carry a promptSnippet",
+	);
+	assert.ok(pi.tools.every((tool) => tool.guidelineCount >= 1));
 	assert.deepEqual(
 		pi.commands.map((command) => command.name),
 		["bg"],
@@ -99,6 +111,7 @@ test("bash_bg execute starts a task and the completion flows to bg_status", asyn
 	const result = await start.execute("call-1", { command: "echo smoke", timeout_sec: 0 });
 	assert.match(result.content[0].text, /Started background task #1/);
 	assert.match(result.content[0].text, /do not poll/);
+	assert.match(result.content[0].text, /bg_status.*id.*1.*progress/s);
 	await waitFor(() => registry.status(1)[0].status !== "running");
 	const status = bgStatusTool({ registry }) as unknown as {
 		execute: (id: string, params: Record<string, unknown>) => Promise<{ content: { text: string }[] }>;

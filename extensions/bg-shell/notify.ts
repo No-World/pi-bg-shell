@@ -104,7 +104,10 @@ export class CompletionNotifier {
 		this.pending = [];
 		if (batch.length === 0) return;
 		const raw = batch.length === 1 ? this.formatSingle(batch[0]) : this.formatGrouped(batch);
-		const content = this.truncateForModel(raw);
+		// The follow-up hint is appended after truncation so it always survives —
+		// it is the strongest in-context steer toward bg_status/bg_kill.
+		const content =
+			`${this.truncateForModel(raw)}\n(bg_status {"id": ${batch[0].snapshot.id}} fetches more output; bg_status lists all tasks; bg_kill {"id": N} stops one)`;
 		try {
 			await this.options.sendMessage(
 				{ customType: "bg-shell-notify", content, display: true, details: undefined },
