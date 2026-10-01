@@ -94,9 +94,12 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("session_shutdown", async (event) => {
+		// Stop this runtime's ticker + widget on every shutdown reason: on
+		// reload the old 500 ms interval would keep painting into a dead ui —
+		// the fresh load rebinds and restarts it in its own session_start.
+		statusBar.clear();
 		if (event.reason === "quit") {
 			notifier.flushNow();
-			statusBar.clear();
 			registry.dispose();
 			return;
 		}

@@ -61,11 +61,17 @@ On Windows, `bash` is typically the WSL relay and inherited Windows file handles
 
 ## User surface
 
-While tasks run, a one-line status widget sits above the editor (the fleet-style bar):
+While tasks run, a fleet-style status widget sits below the editor and repaints every 500 ms — elapsed times tick, each task gets a rotating spinner, and tasks whose output is flowing right now grow a `⎿ ↓ +N` activity subline:
 
 ```
-▶ bg 2 running: #1 npm test (1m12s) · #2 vite dev (0m31s) — /bg panel
+▶ bg · background
+ ├─ ⠋ #1 npm test · 1m 12s
+ │    ⎿ ↓ +2.1k
+ └─ ⠸ #2 vite dev · 31s
+ 2 running · /bg panel
 ```
+
+More than six running tasks collapse into `… +N more`; the widget (and its ticker) removes itself when the last task ends.
 
 All information views open an overlay panel — never dump into the transcript:
 

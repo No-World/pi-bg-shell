@@ -12,9 +12,9 @@ _Avoid_: 子 agent（那是 pi-subagents 的完整 agent 会话；后台任务�
 `/bg` 拉起的 overlay 弹窗（列表 + 详情两视图），对齐 pi-subagents fleet 视图的交互（↑↓ 选、Enter 详情、K 杀、q 关）。所有查看类指令都落在这里，不往正文窗口回内容。
 _Avoid_: fleet 视图（那是 subagent 的词；这里是任务面板）、列表命令（面板是弹窗不是列表输出）。
 
-**状态条**：
-有任务运行时常驻编辑器上方的一行 widget（`▶ bg N running: …`），无任务自动消失；fork 自 subagent 的常驻状态栏模式。
-_Avoid_: 状态栏/footer（footer 是 pi 底栏；状态条是 editor 上方 widget）、toast（那是 notify 瞬时提示）。
+**状态窗**：
+有任务运行时常驻编辑器下方的多行 fleet 树 widget（表头 + 每任务一行 spinner/计时 + `⎿ ↓ +N` 活动行 + 尾行），500ms 活重绘，无任务自动连 ticker 一起消失；fork 自 pi-subagents 的 fleet-status 模式。
+_Avoid_: 状态栏/footer（footer 是 pi 底栏；状态窗是 editor 下方 widget）、toast（那是 notify 瞬时提示）、状态条（那是旧的单行形态）。
 
 **任务状态**：
 五值：`running` / `completed`（退出码 0）/ `failed`（非 0 或 spawn 失败）/ `killed`（被 `bg_kill`）/ `timeout`（超时击杀）。
