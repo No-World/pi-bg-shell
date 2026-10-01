@@ -305,6 +305,8 @@ export interface DetachedManifest {
 	statusPath: string;
 	/** Windows+WSL only: host-written wrapper script — keeps "$?" out of argv (PITFALLS P6). */
 	wrapperPath?: string;
+	/** Owning pi process; a live foreign owner keeps its pool private (ADR-0006). */
+	ownerPid?: number;
 	pattern: { literal: string; all: boolean; fired: boolean } | undefined;
 }
 
@@ -425,6 +427,9 @@ function readManifest(path: string): DetachedManifest | undefined {
 			return undefined;
 		}
 		if (manifest.wrapperPath !== undefined && typeof manifest.wrapperPath !== "string") {
+			return undefined;
+		}
+		if (manifest.ownerPid !== undefined && typeof manifest.ownerPid !== "number") {
 			return undefined;
 		}
 		if (
@@ -669,6 +674,7 @@ export class TaskRegistry {
 				cwd,
 				startedAt: this.now(),
 				hostname: hostname(),
+				ownerPid: process.pid,
 				stdoutPath,
 				stderrPath,
 				statusPath,
@@ -803,9 +809,17 @@ export class TaskRegistry {
 					env,
 					detached: true, // setsid: new process group, survives pi
 					stdio: ["ignore", outFd, errFd],
+					windowsHide: true,
 				});
 			} else {
-				child = spawnFn("bash", ["-c", command], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+				// windowsHide: on win32 every bash is the WSL relay — a console
+				// subsystem child would otherwise pop a window per spawn.
+				child = spawnFn("bash", ["-c", command], {
+					cwd,
+					env,
+					stdio: ["ignore", "pipe", "pipe"],
+					windowsHide: true,
+				});
 			}
 		} catch (error) {
 			task.snapshot.errorMessage = String(error);
@@ -1046,6 +1060,31 @@ export class TaskRegistry {
 		}
 	}
 
+	/**
+	 * Transfer a dead-owner (or legacy) manifest to this process: rm +
+	 * exclusive "wx" rewrite inside the trusted session dir. The exclusive
+	 * create is the claim — a concurrent pi that loses the race gets EEXIST,
+	 * re-reads, and sees our live pid, leaving us the sole adopter. A starter
+	 * that read the pre-claim bytes before our rm can still double-adopt in
+	 * that microsecond window (ADR-0006 notes the residual race); steady-state
+	 * isolation does not depend on winning it.
+	 */
+	private claimManifestOwnership(manifestPath: string, manifest: DetachedManifest): boolean {
+		manifest.ownerPid = process.pid;
+		try {
+			rmSync(manifestPath, { force: true });
+			const fd = openSync(manifestPath, "wx", 0o600);
+			try {
+				writeSync(fd, JSON.stringify(manifest, null, "\t"));
+			} finally {
+				closeSync(fd);
+			}
+			return true;
+		} catch {
+			return false; // lost the claim race (or fs hiccup) — treat as not ours
+		}
+	}
+
 	/** Register a task from a previous session's manifest; returns its snapshot. */
 	private registerAdopted(manifest: DetachedManifest, manifestPath: string, deadOnArrival: boolean): TaskSnapshot {
 		// An adoption-side .fired marker counts exactly like manifest.fired.
@@ -1167,6 +1206,19 @@ export class TaskRegistry {
 					continue;
 				}
 				if (manifest.hostname !== hostname()) continue; // foreign tmp mount
+				// Pool ownership (ADR-0006): a manifest owned by a live foreign pi
+				// process belongs to that process's pool — skip it entirely (not
+				// listed, not reaped, not killed). Legacy manifests without
+				// ownerPid (pre-ownership artifacts) and dead-owner orphans stay
+				// adoptable so survivors keep their re-adoption contract.
+				if (
+					manifest.ownerPid !== undefined &&
+					manifest.ownerPid !== process.pid &&
+					pidAlive(manifest.ownerPid)
+				) {
+					continue;
+				}
+				if (!this.claimManifestOwnership(manifestPath, manifest)) continue;
 				if (!pidAlive(manifest.pid)) {
 					this.registerAdopted(manifest, manifestPath, true);
 					continue;
