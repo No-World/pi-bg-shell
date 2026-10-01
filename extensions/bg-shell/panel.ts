@@ -1,10 +1,14 @@
 /**
  * Fleet-style overlay panel for background tasks (the /bg popup).
  *
- * Two views in one component: a selectable task list and a per-task detail
- * with output tails. Input is matched against raw terminal escape sequences
- * and single characters — no pi-tui runtime import — so the component is
- * fully unit-testable under `node --test`. The real Theme injected by the
+ * Visual contract: a full box border (╭─╮ │ ╰─╯) with the title embedded in
+ * the top edge, and every body row background-filled to the full inner width
+ * — that combination is what makes it read as a modal popup instead of text
+ * floating in the transcript.
+ *
+ * Input is matched against raw terminal escape sequences and single
+ * characters — no pi-tui runtime import — so the component is fully
+ * unit-testable under `node --test`. The real Theme injected by the
  * ui.custom() factory satisfies PanelTheme structurally.
  */
 
@@ -13,6 +17,8 @@ import { formatShort } from "./status-bar.ts";
 
 export interface PanelTheme {
 	fg(role: never, text: string): string;
+	bg(role: never, text: string): string;
+	bold(text: string): string;
 }
 
 const STATUS_ROLE: Record<TaskSnapshot["status"], string> = {
@@ -155,35 +161,47 @@ export class BgPanelComponent {
 	}
 
 	render(width: number): string[] {
-		const lines: string[] = [];
-		const theme = this.deps.theme;
-		const title = this.view === "list" ? " bg tasks " : ` bg task #${this.detailId ?? "?"} `;
-		lines.push(
-			theme.fg("borderMuted" as never, `──${"─".repeat(Math.max(0, Math.min(8, width)))}`) +
-				theme.fg("accent" as never, title),
-		);
-		lines.push("");
-		if (this.view === "list") {
-			lines.push(...this.renderList());
-		} else {
-			lines.push(...this.renderDetail());
+		if (width < 24) {
+			return [fitLine("bg panel: q closes (needs 24+ cols)", width)];
 		}
-		lines.push("");
-		const help =
-			this.view === "list"
-				? "↑↓ select · enter detail · K kill · r refresh · q close"
-				: "esc back · K kill · r refresh · q close";
-		lines.push(theme.fg("dim" as never, `  ${help}`));
-		return lines.map((line) => truncateByWidth(line, width));
+		const body = this.view === "list" ? this.renderList() : this.renderDetail();
+		return this.frame(body, width);
+	}
+
+	/** Full box border + background-filled rows — what makes it read as a popup. */
+	private frame(body: string[], width: number): string[] {
+		const theme = this.deps.theme;
+		const inner = width - 2;
+		const title = this.view === "list" ? " bg tasks " : ` bg task #${this.detailId ?? "?"} `;
+		const left = Math.max(1, Math.floor((inner - displayWidth(title)) / 2));
+		const right = Math.max(1, inner - displayWidth(title) - left);
+		const lines: string[] = [
+			theme.fg("border" as never, `╭${"─".repeat(left)}`) +
+				theme.bold(theme.fg("accent" as never, title)) +
+				theme.fg("border" as never, `${"─".repeat(right)}╮`),
+		];
+		for (const line of body) {
+			lines.push(
+				theme.fg("border" as never, "│") +
+					theme.bg("customMessageBg" as never, fitLine(line, inner)) +
+					theme.fg("border" as never, "│"),
+			);
+		}
+		lines.push(theme.fg("border" as never, `╰${"─".repeat(inner)}╯`));
+		return lines;
 	}
 
 	private renderList(): string[] {
 		const theme = this.deps.theme;
 		if (this.tasks.length === 0) {
-			return [theme.fg("dim" as never, "  No background tasks yet — the agent starts them with bash_bg.")];
+			return [
+				theme.fg("dim" as never, " No background tasks yet — the agent starts them with bash_bg."),
+				"",
+				helpLine("list"),
+			];
 		}
 		const now = this.now();
-		return this.tasks.map((task, index) => {
+		const rows = this.tasks.map((task, index) => {
 			const marker = index === this.selected ? "▸ " : "  ";
 			const time =
 				task.status === "running"
@@ -191,28 +209,30 @@ export class BgPanelComponent {
 					: `${task.status}${task.exitCode !== null ? ` exit ${task.exitCode}` : ""} in ${formatShort(
 							Math.floor((task.durationMs ?? 0) / 1000),
 						)}`;
-			const body = theme.fg(STATUS_ROLE[task.status] as never, `#${task.id} ${time}`) +
+			const body =
+				theme.fg(STATUS_ROLE[task.status] as never, `#${task.id} ${time}`) +
 				theme.fg("muted" as never, ` · ${task.label}`);
 			return `${theme.fg("accent" as never, marker)}${body}`;
 		});
+		return [...rows, "", helpLine("list")];
 	}
 
 	private renderDetail(): string[] {
 		const theme = this.deps.theme;
 		const task = this.tasks.find((entry) => entry.id === this.detailId);
-		if (!task) return [theme.fg("dim" as never, "  Task evicted or unknown.")];
+		if (!task) return [theme.fg("dim" as never, " Task evicted or unknown."), "", helpLine("detail")];
 		const output: TaskOutput | undefined = this.deps.registry.output(task.id, this.detailBytes);
 		const lines: string[] = [];
 		lines.push(
-			theme.fg(STATUS_ROLE[task.status] as never, `  ${task.status}`) +
+			theme.fg(STATUS_ROLE[task.status] as never, ` ${task.status}`) +
 				(task.exitCode !== null ? theme.fg("muted" as never, ` exit ${task.exitCode}`) : "") +
 				(task.durationMs !== undefined
 					? theme.fg("muted" as never, ` in ${formatShort(Math.floor(task.durationMs / 1000))}`)
 					: ""),
 		);
-		lines.push(theme.fg("muted" as never, `  cmd: ${task.command}`));
+		lines.push(theme.fg("muted" as never, ` cmd: ${task.command}`));
 		if (task.errorMessage !== undefined) {
-			lines.push(theme.fg("error" as never, `  error: ${task.errorMessage}`));
+			lines.push(theme.fg("error" as never, ` error: ${task.errorMessage}`));
 		}
 		lines.push("");
 		if (output) {
@@ -220,28 +240,74 @@ export class BgPanelComponent {
 			lines.push("");
 			lines.push(...this.tailBlock("stderr", output.stderrTail, output.stderrBytes, output.stderrSpillPath));
 		}
+		lines.push("", helpLine("detail"));
 		return lines;
 	}
 
 	private tailBlock(name: string, tail: string, totalBytes: number, spillPath: string | undefined): string[] {
 		const theme = this.deps.theme;
-		const header = theme.fg("dim" as never, `  --- ${name} tail (${tail.length}/${totalBytes} bytes) ---`);
-		if (tail === "") return [header, theme.fg("dim" as never, "  (empty)")];
+		const header = theme.fg("dim" as never, ` --- ${name} tail (${tail.length}/${totalBytes} bytes) ---`);
+		if (tail === "") return [header, theme.fg("dim" as never, " (empty)")];
 		const body = tail
 			.replace(/\n$/, "")
 			.split("\n")
-			.map((line) => `  ${line}`);
+			.map((line) => ` ${line}`);
 		const lines = [header, ...body];
 		if (spillPath !== undefined) {
-			lines.push(theme.fg("dim" as never, `  (full output: ${spillPath})`));
+			lines.push(theme.fg("dim" as never, ` (full output: ${spillPath})`));
 		}
 		return lines;
 	}
 }
 
+function helpLine(view: "list" | "detail"): string {
+	return view === "list"
+		? " ↑↓ select · enter detail · K kill · r refresh · q close"
+		: " esc back · K kill · r refresh · q close";
+}
+
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+
+/** East-Asian wide code-point ranges — CJK labels must count as 2 columns. */
+function isWideCodePoint(code: number): boolean {
+	return (
+		(code >= 0x1100 && code <= 0x115f) ||
+		(code >= 0x2e80 && code <= 0xa4cf) ||
+		(code >= 0xac00 && code <= 0xd7a3) ||
+		(code >= 0xf900 && code <= 0xfaff) ||
+		(code >= 0xfe30 && code <= 0xfe6f) ||
+		(code >= 0xff00 && code <= 0xff60) ||
+		(code >= 0xffe0 && code <= 0xffe6) ||
+		(code >= 0x20000 && code <= 0x3fffd)
+	);
+}
+
+/** Terminal columns occupied by a string, skipping ANSI color escapes. */
+export function displayWidth(text: string): number {
+	let width = 0;
+	for (const char of text.replace(ANSI_RE, "")) {
+		width += isWideCodePoint(char.codePointAt(0) ?? 0) ? 2 : 1;
+	}
+	return width;
+}
+
+/** Pad or width-truncate a row to exactly `width` display columns. */
+export function fitLine(text: string, width: number): string {
+	const current = displayWidth(text);
+	if (current >= width) return truncateByWidth(text, width);
+	return text + " ".repeat(width - current);
+}
+
 function truncateByWidth(line: string, width: number): string {
-	// Code-point slicing keeps CJK label truncation from splitting surrogates;
-	// ANSI-colored lines can miscount, so callers keep lines short by design.
-	const chars = Array.from(line);
-	return chars.length <= width ? line : `${chars.slice(0, Math.max(0, width - 1)).join("")}…`;
+	if (width <= 0) return "";
+	let kept = 0;
+	const out: string[] = [];
+	const plain = line.replace(ANSI_RE, "");
+	for (const char of plain) {
+		const charWidth = isWideCodePoint(char.codePointAt(0) ?? 0) ? 2 : 1;
+		if (kept + charWidth > Math.max(0, width - 1)) break;
+		out.push(char);
+		kept += charWidth;
+	}
+	return displayWidth(plain) <= width - 1 ? plain : `${out.join("")}…`;
 }
