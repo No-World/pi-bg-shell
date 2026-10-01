@@ -68,7 +68,7 @@ export interface PanelHostUi {
 	notify(message: string, type?: "info" | "warning" | "error"): void;
 	custom<T>(
 		factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: T) => void) => unknown,
-		options?: { overlay?: boolean },
+		options?: PanelCustomOptions,
 	): Promise<T>;
 }
 
@@ -79,6 +79,16 @@ export interface BgCommandDeps {
 		ctx: { mode: string; hasUI: boolean; ui: PanelHostUi },
 		initial?: { id?: number; tailBytes?: number },
 	) => void;
+}
+
+/** Structural subset of ui.custom options the panel host needs. */
+export interface PanelCustomOptions {
+	overlay?: boolean;
+	overlayOptions?: {
+		width?: number | `${number}%`;
+		minWidth?: number;
+		maxHeight?: number | `${number}%`;
+	};
 }
 
 const USAGE = "/bg usage: /bg · /bg <id> · /bg tail <id> [bytes] · /bg kill <id> [signal] · /bg log <id>";

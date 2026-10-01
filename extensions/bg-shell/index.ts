@@ -74,7 +74,7 @@ export default function (pi: ExtensionAPI) {
 					},
 					() => done(undefined),
 				),
-			{ overlay: true },
+			{ overlay: true, overlayOptions: { width: "70%", minWidth: 40, maxHeight: "80%" } },
 		);
 	}
 

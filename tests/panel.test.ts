@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BgPanelComponent, parsePanelInput } from "../extensions/bg-shell/panel.ts";
+import { BgPanelComponent, displayWidth, fitLine, parsePanelInput } from "../extensions/bg-shell/panel.ts";
 import { TaskRegistry, type TaskSnapshot } from "../extensions/bg-shell/tasks.ts";
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5000, stepMs = 10): Promise<void> {
@@ -11,7 +11,11 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5000, stepMs = 10):
 	}
 }
 
-const identityTheme = { fg: (_role: never, text: string) => text };
+const identityTheme = {
+	fg: (_role: never, text: string) => text,
+	bg: (_role: never, text: string) => text,
+	bold: (text: string) => text,
+};
 
 function panel(registry: TaskRegistry, onDone: () => void = () => {}, initial?: { id?: number; tailBytes?: number }) {
 	return new BgPanelComponent({ registry, theme: identityTheme, initialId: initial?.id, initialTailBytes: initial?.tailBytes }, onDone);
@@ -115,6 +119,67 @@ test("render truncates lines beyond the terminal width", async () => {
 	const component = panel(registry);
 	const lines = component.render(40);
 	assert.ok(lines.every((line) => Array.from(line).length <= 40));
+	registry.dispose();
+});
+
+test("panel frames every render in a full box border", async () => {
+	const registry = new TaskRegistry({ killGraceMs: 100 });
+	registry.start({ command: "echo framed", label: "frame job", timeoutMs: 0 });
+	const component = panel(registry);
+	const lines = component.render(60);
+	assert.ok(lines[0].startsWith("╭"), "top-left corner");
+	assert.ok(lines[0].endsWith("╮"), "top-right corner");
+	assert.ok(lines.at(-1)?.startsWith("╰"), "bottom-left corner");
+	assert.ok(lines.at(-1)?.endsWith("╯"), "bottom-right corner");
+	assert.ok(lines.slice(1, -1).every((line) => line.startsWith("│") && line.endsWith("│")), "side rails");
+	// Every row occupies exactly the terminal width — background fills the row.
+	assert.ok(lines.every((line) => displayWidth(line) === 60));
+	registry.dispose();
+});
+
+test("panel applies a background to every content row", async () => {
+	const registry = new TaskRegistry({ killGraceMs: 100 });
+	registry.start({ command: "echo bgme", timeoutMs: 0 });
+	let bgCalls = 0;
+	const recordingTheme = {
+		fg: (_role: never, text: string) => text,
+		bg: (_role: never, text: string) => {
+			bgCalls += 1;
+			return text;
+		},
+		bold: (text: string) => text,
+	};
+	const component = new BgPanelComponent({ registry, theme: recordingTheme }, () => {});
+	const lines = component.render(60);
+	assert.ok(lines.length >= 4);
+	assert.equal(bgCalls, lines.length - 2, "every content row is background-filled");
+	registry.dispose();
+});
+
+test("displayWidth counts CJK labels as double-width and fitLine pads to exact width", () => {
+	assert.equal(displayWidth("abc"), 3);
+	assert.equal(displayWidth("后台任务"), 8);
+	assert.equal(displayWidth("\x1b[31mred\x1b[0m"), 3);
+	const fitted = fitLine("后台 #1", 20);
+	assert.equal(displayWidth(fitted), 20);
+	assert.ok(fitted.endsWith(" "));
+});
+
+test("CJK task labels keep every framed row at exact terminal width", async () => {
+	const registry = new TaskRegistry({ killGraceMs: 100 });
+	registry.start({ command: "echo 中文", label: "构建任务·全量测试", timeoutMs: 0 });
+	const component = panel(registry);
+	const lines = component.render(48);
+	assert.ok(lines.every((line) => displayWidth(line) === 48));
+	registry.dispose();
+});
+
+test("narrow terminals get a single hint line instead of a broken frame", () => {
+	const registry = new TaskRegistry({ killGraceMs: 100 });
+	registry.start({ command: "echo narrow", timeoutMs: 0 });
+	const lines = panel(registry).render(20);
+	assert.equal(lines.length, 1);
+	assert.match(lines[0], /bg panel.*q closes/s);
 	registry.dispose();
 });
 
