@@ -46,3 +46,4 @@ Date: YYYY-MM-DD
 | [0001](./0001-docs-governance-and-mechanical-gates.md) | 文档治理与机械门禁先行（ADR / PITFALLS / 术语表 / check-docs） | 2026-09-30 | Accepted |
 | [0002](./0002-pr-discipline-and-ci-lane.md) | PR 纪律与 CI 门禁 lane（PR 驱动合入 + issue 绑定声明 + agent 不自批不自合） | 2026-09-30 | Accepted |
 | [0003](./0003-background-shell-wake-mechanism.md) | 后台 shell 唤醒机制：sendMessage + triggerTurn、globalThis 驻留注册表、debounce 合并 | 2026-09-30 | Accepted |
+| [0004](./0004-default-timeout-env-var.md) | 默认超时经 PI_BG_SHELL_TIMEOUT_SEC 环境变量配置 | 2026-10-02 | Accepted |

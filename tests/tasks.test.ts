@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { OutputBuffer, TaskRegistry } from "../extensions/bg-shell/tasks.ts";
+import { defaultTimeoutMsFromEnv, OutputBuffer, TaskRegistry } from "../extensions/bg-shell/tasks.ts";
 
 function tempDir(prefix: string): string {
 	return mkdtempSync(join(tmpdir(), `pi-bg-shell-test-${prefix}-`));
@@ -190,4 +190,20 @@ test("killAll terminates every running task", async () => {
 	assert.equal(registry.status(one.id)[0].status, "killed");
 	assert.equal(registry.status(two.id)[0].status, "killed");
 	registry.dispose();
+});
+
+test("defaultTimeoutMsFromEnv parses PI_BG_SHELL_TIMEOUT_SEC with safe fallbacks", () => {
+	const fallback = 123_000;
+	assert.equal(defaultTimeoutMsFromEnv({}, fallback), fallback, "missing → fallback");
+	assert.equal(defaultTimeoutMsFromEnv({ PI_BG_SHELL_TIMEOUT_SEC: "" }, fallback), fallback, "empty → fallback");
+	assert.equal(defaultTimeoutMsFromEnv({ PI_BG_SHELL_TIMEOUT_SEC: " 3600 " }, fallback), 3_600_000, "trimmed numeric → ms");
+	assert.equal(defaultTimeoutMsFromEnv({ PI_BG_SHELL_TIMEOUT_SEC: "0" }, fallback), 0, "0 disables the default");
+	assert.equal(defaultTimeoutMsFromEnv({ PI_BG_SHELL_TIMEOUT_SEC: "12.5" }, fallback), 12_500, "fractional seconds allowed");
+	for (const bad of ["abc", "-5", "NaN", "Infinity"]) {
+		assert.equal(
+			defaultTimeoutMsFromEnv({ PI_BG_SHELL_TIMEOUT_SEC: bad }, fallback),
+			fallback,
+			`${bad} → fallback`,
+		);
+	}
 });

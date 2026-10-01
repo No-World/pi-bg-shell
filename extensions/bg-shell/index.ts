@@ -15,12 +15,14 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerBgCommand, type PanelHostUi } from "./command.ts";
 import { CompletionNotifier } from "./notify.ts";
 import { BgPanelComponent } from "./panel.ts";
-import { getSharedRegistry } from "./tasks.ts";
+import { defaultTimeoutMsFromEnv, getSharedRegistry } from "./tasks.ts";
 import { BgStatusBar } from "./status-bar.ts";
 import { bashBgTool, bgKillTool, bgStatusTool } from "./tools.ts";
 
 export default function (pi: ExtensionAPI) {
-	const registry = getSharedRegistry();
+	// Env override is read once per process: the shared registry survives
+	// reloads, so the first creation wins (ADR-0004).
+	const registry = getSharedRegistry({ defaultTimeoutMs: defaultTimeoutMsFromEnv() });
 	const notifier = new CompletionNotifier({
 		sendMessage: (message, options) => pi.sendMessage(message, options),
 	});
