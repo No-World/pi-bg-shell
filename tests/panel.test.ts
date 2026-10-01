@@ -98,6 +98,8 @@ test("empty list shows a hint instead of rows", () => {
 	const registry = new TaskRegistry({ killGraceMs: 100 });
 	const lines = panel(registry).render(100).join("\n");
 	assert.match(lines, /No background tasks yet/);
+	// The home-page help must advertise both close keys — not q alone.
+	assert.match(lines, /q\/esc close/);
 	registry.dispose();
 });
 
@@ -179,7 +181,7 @@ test("narrow terminals get a single hint line instead of a broken frame", () => 
 	registry.start({ command: "echo narrow", timeoutMs: 0 });
 	const lines = panel(registry).render(20);
 	assert.equal(lines.length, 1);
-	assert.match(lines[0], /bg panel.*q closes/s);
+	assert.match(lines[0], /bg panel.*q\/esc/s);
 	registry.dispose();
 });
 

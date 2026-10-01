@@ -37,7 +37,7 @@ All information views open an overlay panel — never dump into the transcript:
 
 | Command | What opens |
 |---------|------------|
-| `/bg` | Overlay panel: task list, `↑↓` select, `Enter` detail, `K` kill, `r` refresh, `q` close |
+| `/bg` | Overlay panel: task list, `↑↓` select, `Enter` detail, `K` kill, `r` refresh, `q`/`esc` close |
 | `/bg <id>` | The panel focused on one task's detail (status, exit code, command, output tails, spill path) |
 | `/bg tail <id> [bytes]` | Same detail view with a larger output tail (default 4096 bytes) |
 | `/bg log <id>` | Same detail view; truncated tasks show their full-output spill path |
