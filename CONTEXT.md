@@ -20,6 +20,18 @@ _Avoid_: 状态栏/footer（footer 是 pi 底栏；状态条是 editor 上方 wi
 五值：`running` / `completed`（退出码 0）/ `failed`（非 0 或 spawn 失败）/ `killed`（被 `bg_kill`）/ `timeout`（超时击杀）。
 _Avoid_: 成功/失败对（failed 覆盖 spawn 错误，不只是非零退出；killed 与 failed 严格区分——前者是主动终止）。
 
+**脱离任务**：
+`detach: true` 启动的任务：setsid 独立进程组、输出直写文件、真实退出码由包装 printf 落盘；pi 退出不杀不清理，下个会话凭清单自动领养。救「会话关闭」，救不了「关机」。
+_Avoid_: 孤儿进程（那是指无人收尸的失控进程；脱离任务有清单可认领）、守护进程（不自启、不重启，只存活）。
+
+**清单文件**：
+脱离任务的认领凭据（tmpdir 下 0600 JSON）：pid、命令、三个文件路径、hostname、pattern 的 fired 状态。quit 保留运行中任务的清单；死亡任务被领养或淘汰时清除。
+_Avoid_: PID 文件（只存 pid 不够认领）、配置文件（它是运行时凭据不是配置）。
+
+**领养**：
+新会话 session_start 扫描清单目录收编脱离任务：活着的恢复跟踪与唤醒（含 on_pattern 续效与陈旧命中补发），死了的静默登记终态、不唤醒。reload 后注册表仍在，不重复领养。
+_Avoid_: bg_attach（那是显式认领工具名，V1 未提供；自动领养不是 attach）、重连（没有连接，是重新跟踪）。
+
 **尾部缓冲**：
 每流（stdout/stderr）1 MiB 的内存缓冲，只保留末尾；内存中超出即触发溢写。
 _Avoid_: 全量缓存（无界内存是事故配方）、日志（那是溢写文件的职责）。

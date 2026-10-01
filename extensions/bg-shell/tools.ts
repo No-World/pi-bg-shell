@@ -27,6 +27,30 @@ const BashBgParams = Type.Object({
 		}),
 	),
 	label: Type.Optional(Type.String({ description: "Short human label; defaults to the command prefix." })),
+	on_pattern: Type.Optional(
+		Type.String({
+			description:
+				'Literal string; wake the agent the first time an output line contains it (e.g. "ROOTED"). The task keeps running unless on_pattern_stop is set.',
+		}),
+	),
+	on_pattern_all: Type.Optional(
+		Type.Boolean({ description: "With on_pattern: fire on every matching line (rate-limited) instead of only the first." }),
+	),
+	on_pattern_stop: Type.Optional(
+		Type.Boolean({ description: "With on_pattern: stop the task (SIGTERM) right after delivering the match notification." }),
+	),
+	report_every_sec: Type.Optional(
+		Type.Number({
+			description:
+				"While the task runs, deliver a progress report (elapsed + output tail) every this many seconds, without interrupting it. Clamped to >= 5.",
+		}),
+	),
+	detach: Type.Optional(
+		Type.Boolean({
+			description:
+				"Run detached from the pi process: the task survives pi quitting (machine reboots still kill it). Output goes to files; the next pi session re-adopts it automatically. Timeout defaults to off.",
+		}),
+	),
 });
 
 const BgStatusParams = Type.Object({
@@ -79,9 +103,10 @@ function patternSummary(state: TaskSnapshot["pattern"]): string {
 }
 
 function summaryLine(task: TaskSnapshot, nowMs: number): string {
+	const matched = task.pattern !== undefined && task.pattern.matches > 0 ? `·matched×${task.pattern.matches}` : "";
 	const time =
 		task.status === "running"
-			? `running ${formatDuration(Math.max(0, nowMs - task.startedAt))}`
+			? `running${matched} ${formatDuration(Math.max(0, nowMs - task.startedAt))}`
 			: `${task.status}${task.exitCode !== null ? ` exit ${task.exitCode}` : ""}${
 					task.durationMs !== undefined ? ` in ${formatDuration(task.durationMs)}` : ""
 				}`;
@@ -123,6 +148,7 @@ export function bashBgTool(deps: BgToolDeps) {
 			"bash_bg returns immediately; results arrive as a bg-shell-notify completion message — never poll in a loop, just continue other work.",
 			"Progress checks and terminations go through bg_status and bg_kill, not ps/grep/kill via bash.",
 			"Each bash_bg task runs in a fresh bash -c shell with no session state — pass cwd and env instead of re-declaring inline VAR=... prefixes in every command.",
+			"For tasks that must outlive the session (multi-hour runners), pass detach: true — the task survives quitting pi and the next session re-adopts it automatically.",
 		],
 		parameters: BashBgParams,
 		executionMode: "sequential" as const,
@@ -139,10 +165,38 @@ export function bashBgTool(deps: BgToolDeps) {
 				timeoutMs: params.timeout_sec !== undefined ? Math.max(0, params.timeout_sec) * 1000 : undefined,
 				env: params.env,
 				label: params.label,
+				pattern:
+					params.on_pattern !== undefined
+						? {
+								literal: params.on_pattern,
+								all: params.on_pattern_all ?? false,
+								stop: params.on_pattern_stop ?? false,
+							}
+						: undefined,
+				reportEveryMs:
+					params.report_every_sec !== undefined ? Math.max(5, params.report_every_sec) * 1000 : undefined,
+				detach: params.detach ?? false,
 			});
 			deps.onChange?.();
+			const extras: string[] = [];
+			if (params.on_pattern !== undefined) {
+				extras.push(
+					`Armed on_pattern "${params.on_pattern}" — you will be woken when it appears in the output; ` +
+						(params.on_pattern_stop ? "the task is then stopped." : "the task keeps running."),
+				);
+			}
+			if (params.report_every_sec !== undefined) {
+				extras.push(`Progress reports arrive every ${Math.max(5, params.report_every_sec)}s while it runs.`);
+			}
+			if (params.detach) {
+				extras.push(
+					"Detached: survives pi quitting; the next session re-adopts it automatically. " +
+						(snapshot.timeoutMs > 0 ? `Timeout ${snapshot.timeoutMs / 1000}s still applies.` : "No default timeout."),
+				);
+			}
 			const text =
 				`Started background task #${snapshot.id} (pid ${snapshot.pid ?? "?"}): ${snapshot.label}\n` +
+				(extras.length > 0 ? `${extras.join("\n")}\n` : "") +
 				`A completion notification with the output arrives automatically on exit — continue working; do not poll.\n` +
 				`On-demand checks: bg_status {"id": ${snapshot.id}} for progress, bg_kill {"id": ${snapshot.id}} to stop it.`;
 			return {
@@ -188,6 +242,9 @@ export function bgStatusTool(deps: BgToolDeps) {
 					`${snapshot.exitCode !== null ? ` (exit ${snapshot.exitCode})` : ""}` +
 					`${snapshot.signal ? ` (signal ${snapshot.signal})` : ""}\n` +
 					`command: ${snapshot.command}\ncwd: ${snapshot.cwd}\n` +
+				(snapshot.detached
+					? `detached: survives session exit${snapshot.adopted ? "; adopted from a previous session" : ""}\n`
+					: "") +
 					(snapshot.status === "running"
 						? `running for ${formatDuration(now - snapshot.startedAt)}, timeout ${formatDuration(snapshot.timeoutMs)}\n`
 						: `duration: ${snapshot.durationMs !== undefined ? formatDuration(snapshot.durationMs) : "?"}\n`) +
