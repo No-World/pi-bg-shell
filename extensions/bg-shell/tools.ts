@@ -14,7 +14,10 @@ const BashBgParams = Type.Object({
 	command: Type.String({ description: "Shell command to run (executed with bash -c)." }),
 	cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the session cwd." })),
 	timeout_sec: Type.Optional(
-		Type.Number({ description: "Kill the task after this many seconds. Default 600; 0 disables the timeout." }),
+		Type.Number({
+			description:
+				"Kill the task after this many seconds. Default 600, or the PI_BG_SHELL_TIMEOUT_SEC env var; 0 disables the timeout.",
+		}),
 	),
 	env: Type.Optional(
 		Type.Record(Type.String(), Type.String(), {

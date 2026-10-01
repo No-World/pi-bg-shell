@@ -60,6 +60,14 @@ pi --extension /path/to/pi-bg-shell/extensions/bg-shell/index.ts
 
 `/reload` 与会话切换保留运行中的任务；退出 pi 时 SIGTERM+SIGKILL 全部子进程并清理溢写文件。
 
+## 配置
+
+| 环境变量 | 作用 |
+|---------|------|
+| `PI_BG_SHELL_TIMEOUT_SEC` | 未传 `timeout_sec` 时的默认限时（秒）。默认 `600`；设为 `0` 关闭默认限时。在 pi 启动时读取一次，修改变量后需重启 pi 生效。 |
+
+`bash_bg` 显式传入的 `timeout_sec` 永远优先于环境变量默认值。
+
 ## 唤醒机制
 
 1. `bash_bg` 拉起子进程；工具结果瞬间返回。

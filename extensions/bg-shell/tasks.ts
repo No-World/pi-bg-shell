@@ -190,6 +190,25 @@ export interface RegistryOptions {
 	now?: () => number;
 }
 
+/** Env var overriding the default task timeout. Read once at load (ADR-0004). */
+export const DEFAULT_TIMEOUT_ENV = "PI_BG_SHELL_TIMEOUT_SEC";
+
+/**
+ * Parse PI_BG_SHELL_TIMEOUT_SEC into a default timeout in ms. Missing, empty,
+ * non-finite, or negative values fall back to the given default; 0 disables
+ * the default timeout entirely (per-task timeout_sec still applies).
+ */
+export function defaultTimeoutMsFromEnv(
+	env: Record<string, string | undefined> = process.env,
+	fallbackMs: number = 10 * 60 * 1000,
+): number {
+	const raw = env[DEFAULT_TIMEOUT_ENV]?.trim();
+	if (raw === undefined || raw === "") return fallbackMs;
+	const seconds = Number(raw);
+	if (!Number.isFinite(seconds) || seconds < 0) return fallbackMs;
+	return seconds * 1000;
+}
+
 interface TaskInternal {
 	snapshot: TaskSnapshot;
 	child: ChildProcess | undefined;
@@ -486,9 +505,9 @@ const globalStore = globalThis as { [registrySymbol]?: TaskRegistry };
  * children and their buffers keep working, and the fresh entry point rebinds
  * `onExit` so completions still reach the agent.
  */
-export function getSharedRegistry(): TaskRegistry {
+export function getSharedRegistry(options?: RegistryOptions): TaskRegistry {
 	if (globalStore[registrySymbol] === undefined) {
-		globalStore[registrySymbol] = new TaskRegistry();
+		globalStore[registrySymbol] = new TaskRegistry(options);
 	}
 	return globalStore[registrySymbol];
 }

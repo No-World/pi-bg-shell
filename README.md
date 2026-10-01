@@ -60,6 +60,14 @@ pi --extension /path/to/pi-bg-shell/extensions/bg-shell/index.ts
 
 Reloads (`/reload`) and session switches keep running tasks alive; quitting pi SIGTERMs+SIGKILLs every child and removes spill files.
 
+## Configuration
+
+| Env var | Effect |
+|---------|--------|
+| `PI_BG_SHELL_TIMEOUT_SEC` | Default wall-clock limit per task when `timeout_sec` is omitted. Defaults to `600`; set `0` to disable the default. Read once at pi startup — restarting pi applies a new value. |
+
+An explicit `timeout_sec` on a `bash_bg` call always wins over the environment default.
+
 ## How the wake works
 
 1. `bash_bg` spawns the child; the tool result returns instantly.
