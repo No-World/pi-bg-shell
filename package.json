@@ -1,6 +1,6 @@
 {
 	"name": "pi-bg-shell",
-	"version": "0.1.0",
+	"version": "0.3.0",
 	"description": "Background shell tasks for the Pi coding agent: start non-blocking commands with bash_bg and get woken with the output when they exit, Claude Code style.",
 	"type": "module",
 	"repository": {

@@ -24,7 +24,8 @@ concurrency:
 jobs:
   checks:
     name: npm test + typecheck
-    runs-on: ubuntu-latest
+        # Pinned: ubuntu-latest flips to Ubuntu 26 on 2026-10-19 — no toolchain shifts under a release.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -41,7 +42,8 @@ jobs:
   pr-issue-link:
     name: PR issue binding declaration
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+        # Pinned: ubuntu-latest flips to Ubuntu 26 on 2026-10-19 — no toolchain shifts under a release.
+    runs-on: ubuntu-24.04
     steps:
       - name: Require Closes #N / Refs #N / No-Issue
         env:

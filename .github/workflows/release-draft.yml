@@ -1,0 +1,29 @@
+# Release draft — tag-triggered (v*). The draft is the visible to-do after a
+# tag push; npm publishing waits for the release to be PUBLISHED (see
+# npm-publish.yml and ADR-0008).
+
+name: release draft
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  draft:
+    name: create draft release
+        # Pinned: ubuntu-latest flips to Ubuntu 26 on 2026-10-19 — no toolchain shifts under a release.
+    runs-on: ubuntu-24.04
+    steps:
+      # --generate-notes diffs against the previous published release by
+      # default — exactly the baseline we want; no checkout needed. The repo
+      # must be explicit: without a checkout there is no git context for gh
+      # to resolve it from.
+      - name: Create draft release with generated notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: gh release create "$TAG" --draft --title "$TAG" --generate-notes --repo "$REPO"
