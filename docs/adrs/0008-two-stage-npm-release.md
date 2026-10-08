@@ -18,7 +18,7 @@ Accepted
 2. **publish 才发包**：GitHub Release 的 **published** 事件触发 `npm-publish.yml`：checkout 到 tag → `npm ci` → 版本一致性门禁（tag ↔ package.json，错分支切 tag 在此 fail fast）→ `npm test` + `typecheck` 门禁 → `npm publish --provenance --access public`。
 3. **OIDC trusted publishing**：`id-token: write`，无 NPM_TOKEN secret；npmjs 侧预配置（owner No-World · repository No-World/pi-bg-shell · workflow `npm-publish.yml`）。**workflow 文件名被 npmjs 钉死，不可改名**——改名即静默失效。
 4. **顺序纪律**（AGENTS.md Git & PR Discipline 同款）：version 变更走 PR → 维护者合入 → 才允许推 tag → 补 highlights → 维护者点 publish。tag 永远不先于 PR 合入。
-5. 首版为 `v0.1.0`（package.json 现值，npm 上无占用历史）。
+5. 首版为 `v0.3.0`（维护者选定：项目已有 #15–#25 的实绩积累，0.1.0 低估了成熟度；npm 上无占用历史，首版号自由）。
 
 ## Considered Options
 
