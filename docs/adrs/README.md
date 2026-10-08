@@ -50,3 +50,4 @@ Date: YYYY-MM-DD
 | [0005](./0005-running-event-delivery.md) | 运行中事件投递：on_pattern 模式唤醒与 report_every 进度报告 | 2026-10-02 | Accepted |
 | [0006](./0006-detached-tasks-and-adoption.md) | 脱离任务：detached spawn + 清单领养，任务活过会话退出 | 2026-10-02 | Accepted |
 | [0007](./0007-global-bg-pool-and-subscription.md) | 全局 bg 池与订阅模型：脱离任务从独占属主到多会话订阅 | 2026-10-08 | Accepted |
+| [0008](./0008-two-stage-npm-release.md) | 两段式发版：tag 只出 draft release，点 publish 才触发 npm publish | 2026-10-08 | Accepted |
