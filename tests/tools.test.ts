@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { TaskRegistry } from "../extensions/bg-shell/tasks.ts";
-import { bashBgTool, bgKillTool, bgStatusTool } from "../extensions/bg-shell/tools.ts";
+import { bashBgTool, bgAdoptTool, bgKillTool, bgStatusTool } from "../extensions/bg-shell/tools.ts";
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5000, stepMs = 10): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -47,13 +49,13 @@ function stubPi() {
 	};
 }
 
-test("extension entry registers three tools and a quit-only shutdown handler", async () => {
+test("extension entry registers four tools and a quit-only shutdown handler", async () => {
 	const { default: factory } = await import("../extensions/bg-shell/index.ts");
 	const pi = stubPi();
 	factory(pi as never);
 	assert.deepEqual(
 		pi.tools.map((tool) => tool.name).sort(),
-		["bash_bg", "bg_kill", "bg_status"],
+		["bash_bg", "bg_adopt", "bg_kill", "bg_status"],
 	);
 	assert.ok(pi.tools.every((tool) => tool.hasExecute));
 	// Tools without a promptSnippet are omitted from the system prompt's
@@ -137,6 +139,48 @@ test("bg_kill execute kills a running task and reports already-finished tasks", 
 	const again = await kill.execute("call-3", { id: 1 });
 	assert.match(again.content[0].text, /already killed/);
 	await assert.rejects(kill.execute("call-4", { id: 99 }), /No background task with id 99/);
+	registry.dispose();
+});
+
+test("bg_status lists foreign pool tasks and bg_adopt subscribes to one", async () => {
+	const shared = mkdtempSync(join(tmpdir(), "pi-bg-shell-test-tooladopt-"));
+	const registry = new TaskRegistry({ killGraceMs: 100, detachedDirPath: shared, sessionId: "sess-tool" });
+	const holder = registry.start({ command: "sleep 30", timeoutMs: 0 });
+	await waitFor(() => registry.status(holder.id)[0].status === "running");
+	const dir = join(shared, "s-f");
+	mkdirSync(dir, { recursive: true });
+	const manifestPath = join(dir, "f.json");
+	writeFileSync(join(dir, "o.log"), "");
+	writeFileSync(
+		manifestPath,
+		JSON.stringify({
+			version: 1,
+			pid: holder.pid,
+			command: "sleep 30",
+			label: "foreign-tool",
+			cwd: process.cwd(),
+			startedAt: Date.now(),
+			hostname: hostname(),
+			stdoutPath: join(dir, "o.log"),
+			stderrPath: join(dir, "e.log"),
+			statusPath: join(dir, ".exit"),
+		}),
+	);
+	const status = bgStatusTool({ registry }) as unknown as {
+		execute: (id: string, params: Record<string, unknown>) => Promise<{ content: { text: string }[] }>;
+	};
+	const list = await status.execute("c1", {});
+	assert.match(list.content[0].text, /Global pool/);
+	assert.match(list.content[0].text, /foreign-tool/);
+	const adopt = bgAdoptTool({ registry }) as unknown as {
+		execute: (id: string, params: Record<string, unknown>) => Promise<{ content: { text: string }[] }>;
+	};
+	const adopted = await adopt.execute("c2", { path: manifestPath });
+	assert.match(adopted.content[0].text, /Adopted pool task as #\d+/);
+	assert.match(adopted.content[0].text, /subscribed/);
+	await assert.rejects(adopt.execute("c3", { path: join(dir, "nope.json") }), /no valid manifest/);
+	registry.kill(holder.id, "SIGKILL");
+	await waitFor(() => registry.status(holder.id)[0].status !== "running");
 	registry.dispose();
 });
 

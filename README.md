@@ -22,8 +22,9 @@ Pi's built-in `bash` tool blocks the whole agent turn until the command finishes
 | Tool | What it does |
 |------|--------------|
 | `bash_bg` | Runs a command with `bash -c` in the background and returns immediately with a task id. Bounded tail buffers (1 MiB per stream) capture output; anything larger spills the full history to a file. |
-| `bg_status` | Lists all tasks with one-line summaries, or fetches one task's full status and output tails by id. |
-| `bg_kill` | Terminates a task by id (default `SIGTERM`). |
+| `bg_status` | Lists all tasks with one-line summaries, or fetches one task's full status and output tails by id. The listing also carries a **Global pool** section: detached tasks owned by other sessions, visible but not adopted here. |
+| `bg_kill` | Terminates a task by id (default `SIGTERM`). Kill rights on a pool task belong to its creator or any subscriber — i.e. anyone who can see it in their own registry. |
+| `bg_adopt` | Subscribes this session to a foreign pool task by manifest path (from bg_status's Global pool section): completion notices, pattern wakes, and kill rights follow (ADR-0007). |
 
 Completion is delivered as a `bg-shell-notify` message via `pi.sendMessage({ triggerTurn: true })` — the same wake primitive the official file-trigger example and pi-subagents' completion path use. Completions inside a 100 ms window merge into a single message, so a fan-out of tasks cannot stampede the session. Default wall-clock limit is 10 minutes per task (`timeout_sec` overrides; `0` disables).
 
@@ -48,7 +49,7 @@ Both are delivery-timing controls, not orchestration: what to do next stays with
 
 ### Detached tasks (survive quitting pi)
 
-`bash_bg { detach: true }` runs the command in its own session (setsid) with output going straight to files — quitting pi **does not kill it** (rebooting the machine still does). The real exit code is recorded by a wrapper; a manifest under `tmpdir()/pi-bg-shell/` lets the **next pi session re-adopt** the task automatically: alive ones resume tracking (completion wakes, `on_pattern` keeps watching), already-dead ones register their outcome silently in `bg_status`. The default timeout is off for detached tasks — pass `timeout_sec` explicitly if you want one.
+`bash_bg { detach: true }` runs the command in its own session (setsid) with output going straight to files — quitting pi **does not kill it** (rebooting the machine still does). The real exit code is recorded by a wrapper; a manifest under `tmpdir()/pi-bg-shell/` turns the root into a **machine-wide task pool** (ADR-0007): a session resumed with the same session id (`pi -c` / `--resume`) re-subscribes its survivors automatically; any other session sees them in bg_status's Global pool section and can adopt with `bg_adopt`. Deaths that happened while nobody watched are backfilled **once** by whichever session scans next — merged into one message and annotated `unattended — finished while pi was away` — so a "run and report back" promise survives any restart. The default timeout is off for detached tasks — pass `timeout_sec` explicitly if you want one.
 
 ```
 You:     start the 24h device soak, detached, wake me on ROOTED
@@ -59,7 +60,7 @@ Notify:  Background task #1 pattern match (on_pattern "ROOTED", match #1, runnin
 
 `bg_kill` signals the detached task's whole process group.
 
-On Windows, `bash` is typically the WSL relay and inherited Windows file handles cannot cross that boundary — detached tasks there switch to shell-side redirection (`( cmd ) >> OUT 2>> ERR` with `/mnt/<drive>/…`-translated paths), so output files and exit codes still land exactly where `bg_status` and re-adoption expect them. The wrapper itself ships as a host-side script file (`bash <file>`, never `-c` argv) so the recorded exit code survives the relay's argument re-quoting. On Windows the detached relay is started through a GUI-subsystem wscript launcher — `detached` + `windowsHide` alone still pops a console — so spawns are popup-free and the task even survives the hosting terminal being closed. `bg_kill` on Windows terminates the whole relay tree via `taskkill /t /f` (there are no POSIX signals across the boundary). `on_pattern` watches an owned detached task's output from byte zero — early startup milestones wake the session just like adopted ones (which replay history). Pools are per pi process: each manifest records its owner, and a concurrent pi process never touches a live owner's tasks — only orphans whose owner is gone get re-adopted.
+On Windows, `bash` is typically the WSL relay and inherited Windows file handles cannot cross that boundary — detached tasks there switch to shell-side redirection (`( cmd ) >> OUT 2>> ERR` with `/mnt/<drive>/…`-translated paths), so output files and exit codes still land exactly where `bg_status` and pool scans expect them. The wrapper itself ships as a host-side script file (`bash <file>`, never `-c` argv) so the recorded exit code survives the relay's argument re-quoting. On Windows the detached relay is started through a GUI-subsystem wscript launcher — `detached` + `windowsHide` alone still pops a console — so spawns are popup-free and the task even survives the hosting terminal being closed. `bg_kill` on Windows terminates the whole relay tree via `taskkill /t /f` (there are no POSIX signals across the boundary) and writes a kill-attribution marker so other subscribers' notices say who killed the task. `on_pattern` watches an owned detached task's output from byte zero — early startup milestones wake the session just like adopted ones (which replay history). The pool is a bulletin board, not private property (ADR-0007): every session sees every manifest, subscription is a per-pid marker file (exclusive-create, so concurrent sessions never race), and artifacts are collected only once a task is terminal, reported, unsubscribed, and its creating process is gone.
 
 ## User surface
 
