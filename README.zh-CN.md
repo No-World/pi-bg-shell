@@ -29,7 +29,7 @@ Pi 内置的 `bash` 工具会阻塞整个 agent 轮次直到命令结束——�
 
 退出不再是唯一的交付时机（ADR-0005）：
 
-- **`on_pattern`**——字面子串、逐行匹配（grep 语义）。首次命中即唤醒 agent，附命中行与输出尾部；任务**继续运行**。`on_pattern_all` 改为每次命中都唤醒（限频），`on_pattern_stop` 在投递命中后立即停掉任务。运行中 `bg_status` 显示 `running·matched×N` 子状态。
+- **`on_pattern`**——字面子串、逐行匹配（grep 语义）。首次命中即唤醒 agent，附命中行与输出尾部；任务**继续运行**。`on_pattern_all` 改为每次命中都唤醒（限频），`on_pattern_stop` 在投递命中后立即停掉任务。运行中 `bg_status` 显示 `running·matched×N` 子状态。对会反复发生的告警（守望），优先常驻任务（`timeout_sec: 0`）+ `on_pattern_all`，而非每次命中后重新拉起；标记只在状态变化时输出，持续满足的条件会按 10s 下限反复唤醒。
 - **`report_every_sec`**——任务运行期间每 N 秒（钳到 ≥5）投递一份进度报告（已运行时长 + 输出尾部），不中断任务。
 
 ```

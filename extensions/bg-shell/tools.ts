@@ -30,11 +30,14 @@ const BashBgParams = Type.Object({
 	on_pattern: Type.Optional(
 		Type.String({
 			description:
-				'Literal string; wake the agent the first time an output line contains it (e.g. "ROOTED"). The task keeps running unless on_pattern_stop is set.',
+				'Literal string; wake the agent the first time an output line contains it (e.g. "ROOTED"). The task keeps running unless on_pattern_stop is set. For alerts that can recur (watches), prefer on_pattern_all on a long-lived task (timeout_sec 0) over re-spawning after each hit.',
 		}),
 	),
 	on_pattern_all: Type.Optional(
-		Type.Boolean({ description: "With on_pattern: fire on every matching line (rate-limited) instead of only the first." }),
+		Type.Boolean({
+			description:
+				'With on_pattern: fire on every matching line (rate-limited) instead of only the first. For watches, echo the marker on state transitions only — a condition that persists would otherwise re-wake the agent at the 10 s floor.',
+		}),
 	),
 	on_pattern_stop: Type.Optional(
 		Type.Boolean({ description: "With on_pattern: stop the task (SIGTERM) right after delivering the match notification." }),
