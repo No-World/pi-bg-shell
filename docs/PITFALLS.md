@@ -93,3 +93,13 @@
 **Avoid**: ① 弹窗：detached 控制台链必须经 **GUI 子系统启动器**中转（wscript.exe + `Run cmd, 0, True`——GUI 进程无控制台可弹，且免疫「关终端杀树」，宿主终端关闭不再波及任务）；② 杀树：`taskkill /pid <pid> /t /f`（/f 即 TerminateProcess，与 Node kill 同强度，无优雅退路可守）。
 
 **Recovery**: 已弹窗口属旧任务，结束或 `taskkill /t` 后消失；杀不死的任务手工 `taskkill /pid <pid> /t /f`。
+
+### P9: 长空窗后补发的心跳报告制造「任务刚起」错觉（elapsed 计时本身是对的）
+
+**Trap**: 宿主睡眠/长空窗期间全部冻结，醒来后 catch-up 心跳一次性抵达：`still running (34103.7s elapsed)` 配着 tail 开头的 `armed 12:37`——session13 的 agent 与用户先后把 tail 的新近感当任务年龄，误报「刚起 13 分钟显示 9.5h，elapsed 坏了」，该误报还一度被立条成「WSL 时钟倾斜」根因。
+
+**Why**: 事后对账（session13 转录全量 312 个事件 × spawn 时间戳）：296 个漂移 <1s；唯一「9.5h 异常」实为 9.47h 宿主睡眠空窗（12:37→22:05），notify 抵达时刻 − spawn = 34103.8s，与声称 elapsed 差 **+0.1s**——计时精确，错在把「报告到达」锚定成「任务起点」；tail 是最旧输出不是最新状态。
+
+**Avoid**: 判读 elapsed 异常先对账 notify 行时间戳 − 任务 spawn 时间戳；notify 行时间是投递时间，忙/闲会话下晚于事件时间（实测投递滞后最多 ~8 分钟）；别用 tail 推断任务年龄。
+
+**Recovery**: 据误报写下的根因要显式撤回重写（本条即首版自纠的留档）；基于「计时坏了」做出的决策（杀任务/重启守望）回溯复核。

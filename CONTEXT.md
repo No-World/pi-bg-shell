@@ -55,7 +55,7 @@ _Avoid_: 推送/push（不是网络语义）、回调（那是实现层 `onExit`
 _Avoid_: 风暴合并（合并是手段，风暴才是问题名）。
 
 **模式唤醒**：
-`on_pattern` 的字面子串、逐行（grep 语义）监视；首次命中即唤醒，任务继续运行，`stop` 模式在投递后停任务。命中次数在快照上作 running 的子状态呈现（`running·matched×N`）。
+`on_pattern` 的字面子串、逐行（grep 语义）监视；默认 single-shot——首次命中唤醒一次，后续命中仍计数（`running·matched×N`）但不再唤醒；`all` 模式（`on_pattern_all`）改为每次命中都唤醒，带最小间隔（默认 10s）频率防护；`stop` 模式在投递后停任务。常驻守望必须用 `all` 模式（AGENTS.md 三律③）。
 _Avoid_: 触发器（那是调度器词汇；这里只改交付时机）、正则（显式取舍：字面匹配就够，转义坑不背）。
 
 **进度报告**：
@@ -65,3 +65,7 @@ _Avoid_: 轮询（报告是推送，不是 agent 主动查）、心跳检测（�
 **exit 钩子**：
 注册表上的 `onExit(snapshot, output)`，入口工厂每次加载重绑到当前 runtime 的 notifier（PITFALLS P1 的防线本体）。
 _Avoid_: 监听器（会被误解为 DOM 式多播；它是单槽、可覆盖）。
+
+**守望任务**：
+以 `on_pattern` 告警为唯一目的的长寿命后台任务。规约形态 = 常驻（`timeout_sec: 0`）+ `on_pattern_all` 唤醒 + 脚本内自限速（状态转移或最小间隔才 echo 标记），见 AGENTS.md「BG Task Protocol」第 3 条；需要跨 pi 会话存活的守望加 `detach: true`，下个会话自动领养、pattern 续效。
+_Avoid_: 轮值守望（触发即退 + 人工重臂，被三律③禁掉的反模式，不是守望的合法形态）、单发守望（普通 `on_pattern` 只醒一次，之后静音但看着还在布防——比轮值更危险）、定时任务/cron（守望是条件触发，不是时间调度）。
