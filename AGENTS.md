@@ -28,6 +28,14 @@ Exempt (proceed directly): pure Q&A or read-only exploration; docs/typo/comment-
 
 Decisions that survive the discussion become an ADR — see `docs/adrs/README.md` for the format and the entry threshold (hard to reverse / confusing without context / a real trade-off — one of these).
 
+## BG Task Protocol
+
+Three hard rules for any `bash_bg` task spawned while working in this repo — distilled from a 68-hour, ~70-task dogfooding session (2026-10, "session13"):
+
+1. **Script-file contract.** The task `command` is only ever `bash <path>/script.sh`, with the script written via `write` first. Inline shell in `command` crosses the model → adapter → spawn layers, where variables get eaten and nested quotes get mangled; after adopting this rule the reference session had zero spawn-layer incidents.
+2. **Results land in files.** A task writes its findings to a file, and the file is read in a separate call. Completion-notify tails are occasionally truncated by the same boundary — treat the tail as a ping, not the record. The tail also lies about freshness: after a host-sleep gap the catch-up report makes a 9.5-hour-old task look freshly armed, while the elapsed figure was accurate to +0.1s (session13 audit: 296/312 events within 1s of spawn-time accounting) — trust timestamp math over tail-implied age.
+3. **Resident, self-throttled watches for recurring conditions.** If the alert can fire again, the watch stays resident (`timeout_sec: 0`, `detach: true` when it must outlive the session) and wakes via `on_pattern_all` — **not** plain `on_pattern`, which fires exactly once then stays silent forever while still looking armed (worse than re-arming: a confident blind spot). The script gates markers on state *transitions* — echo when a condition enters, not while it persists (the old `echo marker && exit 0` used re-arming as its reset; hysteresis replaces that) — and the tool's 10 s min-fire floor only guards against stampedes. One-shot watchers (`watch-done`: a trigger that occurs once) may keep the fire-and-exit shape, and need no pattern at all when plain completion notify carries the tail. Forbidden is the manual re-arm loop for recurring alerts — the reference session burned 78 rate + 35 sweep re-arms, 113 of its 132 spawns (86%): its rate script echoed `***RATE_LOW***` then `exit 0`, and sweep signalled via `exit 3`, the same anti-pattern in a `failed` costume (33 false-failure notifies).
+
 ## Documentation Layout
 
 | Document | Answers | Location |
