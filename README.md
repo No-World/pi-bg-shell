@@ -29,7 +29,7 @@ Completion is delivered as a `bg-shell-notify` message via `pi.sendMessage({ tri
 
 Exit is not the only delivery moment anymore (ADR-0005):
 
-- **`on_pattern`** — a literal substring watched line-by-line (grep semantics). The first matching line wakes the agent with the matched line plus the output tail; the task **keeps running**. `on_pattern_all` wakes on every match (rate-limited), `on_pattern_stop` stops the task right after delivering the match. `bg_status` shows `running·matched×N` as a sub-state while it runs.
+- **`on_pattern`** — a literal substring watched line-by-line (grep semantics). The first matching line wakes the agent with the matched line plus the output tail; the task **keeps running**. `on_pattern_all` wakes on every match (rate-limited), `on_pattern_stop` stops the task right after delivering the match. `bg_status` shows `running·matched×N` as a sub-state while it runs. For alerts that can recur (watches), prefer `on_pattern_all` on a long-lived task (`timeout_sec: 0`) over re-spawning after each hit, and echo the marker on state transitions only — a persisting condition would otherwise re-wake at the 10 s floor.
 - **`report_every_sec`** — while the task runs, a progress report (elapsed time + output tail) arrives every N seconds (clamped to ≥ 5) without interrupting it.
 
 ```
