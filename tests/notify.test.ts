@@ -232,3 +232,19 @@ test("mixed running events and exits merge into one events message", async () =>
 	assert.match(content, /#2 pattern match/);
 	assert.match(content, /#1 failed \(exit 2/);
 });
+
+test("headers annotate unattended backfills and foreign kills", () => {
+	const notifier = new CompletionNotifier({ sendMessage: () => {} });
+	const unattended = notifier.formatSingle({
+		snapshot: snapshot({ unattended: true, detached: true, adopted: true }),
+		output: output(),
+		event: undefined,
+	});
+	assert.match(unattended, /unattended — finished while pi was away/);
+	const killed = notifier.formatSingle({
+		snapshot: snapshot({ status: "failed", killedBy: "sess-other", detached: true }),
+		output: output(),
+		event: undefined,
+	});
+	assert.match(killed, /killed by sess-other/);
+});

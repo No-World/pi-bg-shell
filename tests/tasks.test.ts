@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import type { ChildProcess, spawn as spawnType } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -405,7 +406,7 @@ test("win32 kill routes through a hidden taskkill /t /f on the pid", { skip: pro
 
 test("detached tasks survive dispose (quit) and are re-adopted by a fresh session", async () => {
 	const shared = tempDir("det adopt");
-	const first = freshRegistry({ detachedDirPath: shared });
+	const first = freshRegistry({ detachedDirPath: shared, sessionId: "sess-reboot" });
 	const snapshot = first.start({ command: "echo booting; sleep 2", detach: true });
 	const pid = snapshot.pid;
 	assert.ok(pid !== undefined);
@@ -414,7 +415,7 @@ test("detached tasks survive dispose (quit) and are re-adopted by a fresh sessio
 	// adoption would inspect an output file that does not exist yet.
 	await waitFor(() => (first.output(snapshot.id)?.stdoutTail ?? "") !== "", 5000);
 	first.dispose(); // quit: detached survivors keep running, files stay
-	const second = freshRegistry({ adoptPollMs: 50, detachedDirPath: shared });
+	const second = freshRegistry({ adoptPollMs: 50, detachedDirPath: shared, sessionId: "sess-reboot" });
 	assert.equal(second.adoptDetached(), 1);
 	const statuses = second.status();
 	assert.equal(statuses.length, 1);
@@ -430,22 +431,60 @@ test("detached tasks survive dispose (quit) and are re-adopted by a fresh sessio
 	second.dispose();
 });
 
-test("detached tasks that died before adoption register their outcome silently", async () => {
-	const shared = tempDir("det doa");
-	const first = freshRegistry({ detachedDirPath: shared });
+test("deaths the creator already reported are never re-delivered to later scanners", async () => {
+	const shared = tempDir("det reported");
+	const first = freshRegistry({ detachedDirPath: shared, sessionId: "sess-r1" });
 	const snapshot = first.start({ command: "exit 5", detach: true });
-	await waitFor(() => first.status(snapshot.id)[0].status !== "running");
+	await waitFor(() => first.status(snapshot.id)[0].status !== "running"); // creator watched + reported
 	// Simulate a crashed session: no dispose, the manifest stays on disk.
-	const second = freshRegistry({ detachedDirPath: shared });
+	const second = freshRegistry({ detachedDirPath: shared, sessionId: "sess-r2" });
 	const wakes: number[] = [];
 	second.onExit = (finished) => wakes.push(finished.id);
-	assert.equal(second.adoptDetached(), 0, "dead-on-arrival does not count as alive adoption");
+	assert.equal(second.adoptDetached(), 0, "terminal tasks never count as alive adoption");
 	const statuses = second.status();
 	assert.equal(statuses.length, 1);
 	assert.equal(statuses[0].status, "failed");
 	assert.equal(statuses[0].exitCode, 5);
-	assert.deepEqual(wakes, [], "stale deaths never wake the session");
+	assert.deepEqual(wakes, [], "already-reported deaths stay quiet (ADR-0007 .reported)");
 	second.dispose();
+});
+
+test("deaths while pi was away are backfilled once, annotated as unattended", async () => {
+	const shared = tempDir("det backfill");
+	const first = freshRegistry({ detachedDirPath: shared, sessionId: "sess-b1" });
+	const snapshot = first.start({ command: "echo go; sleep 0.4; exit 5", detach: true });
+	await waitFor(() => (first.output(snapshot.id)?.stdoutTail ?? "") !== "", 5000);
+	first.dispose(); // quit BEFORE the task exits: nobody watches it die
+	await waitFor(() => {
+		for (const dir of readdirSync(shared)) {
+			for (const name of readdirSync(join(shared, dir))) {
+				if (!name.endsWith(".exit")) continue;
+				try {
+					if (readFileSync(join(shared, dir, name), "utf8").trim() !== "") return true;
+				} catch {
+					// raced the wrapper's write; retry
+				}
+			}
+		}
+		return false;
+	});
+	const second = freshRegistry({ detachedDirPath: shared, sessionId: "sess-b2" });
+	const wakes: TaskSnapshot[] = [];
+	second.onExit = (finished) => wakes.push(finished);
+	assert.equal(second.adoptDetached(), 0);
+	assert.equal(wakes.length, 1, "unreported deaths backfill exactly once (ADR-0007)");
+	assert.equal(wakes[0].unattended, true, "annotated as unattended");
+	assert.equal(wakes[0].exitCode, 5);
+	assert.equal(second.status()[0].status, "failed");
+	// Idempotence: a third scanner delivers nothing.
+	const third = freshRegistry({ detachedDirPath: shared, sessionId: "sess-b3" });
+	const wakes3: number[] = [];
+	third.onExit = (finished) => wakes3.push(finished.id);
+	third.adoptDetached();
+	assert.deepEqual(wakes3, [], ".reported makes the backfill single-shot");
+	assert.equal(third.status()[0].status, "failed", "still queryable");
+	second.dispose();
+	third.dispose();
 });
 
 test("killing a detached task terminates the whole relay tree on Windows (group on POSIX)", async () => {
@@ -470,9 +509,9 @@ test("detached tasks ignore the default timeout", async () => {
 test("adopted detached tasks keep pattern watching alive", async () => {
 	// The first session's poll is parked (60 s) so it cannot consume the match.
 	const shared = tempDir("det live-pattern");
-	const first = freshRegistry({ adoptPollMs: 60_000, detachedDirPath: shared });
+	const first = freshRegistry({ adoptPollMs: 60_000, detachedDirPath: shared, sessionId: "sess-p1" });
 	first.start({ command: "sleep 0.4; echo HIT; sleep 2", detach: true, pattern: { literal: "HIT" } });
-	const second = freshRegistry({ adoptPollMs: 50, detachedDirPath: shared });
+	const second = freshRegistry({ adoptPollMs: 50, detachedDirPath: shared, sessionId: "sess-p1" });
 	const events: RunningEvent[] = [];
 	second.onRunningEvent = (_snapshot, _output, event) => events.push(event);
 	assert.equal(second.adoptDetached(), 1);
@@ -488,10 +527,10 @@ test("adopted detached tasks keep pattern watching alive", async () => {
 test("a pattern that fired while nobody watched is delivered once on adoption", async () => {
 	// First session crashes before the match; its 60 s poll never persists fired.
 	const shared = tempDir("det stale-pattern");
-	const first = freshRegistry({ adoptPollMs: 60_000, detachedDirPath: shared });
+	const first = freshRegistry({ adoptPollMs: 60_000, detachedDirPath: shared, sessionId: "sess-s1" });
 	first.start({ command: "sleep 0.3; echo ROOTED; sleep 2", detach: true, pattern: { literal: "ROOTED" } });
 	await new Promise((resolve) => setTimeout(resolve, 800)); // ROOTED is now in the log file
-	const second = freshRegistry({ adoptPollMs: 50, detachedDirPath: shared });
+	const second = freshRegistry({ adoptPollMs: 50, detachedDirPath: shared, sessionId: "sess-s1" });
 	const events: RunningEvent[] = [];
 	second.onRunningEvent = (_snapshot, _output, event) => events.push(event);
 	assert.equal(second.adoptDetached(), 1);
@@ -557,22 +596,25 @@ test("manifests owned by a live foreign process are not adopted", async () => {
 		"nothing from the foreign pool is listed",
 	);
 	assert.ok(existsSync(manifestPath), "the foreign manifest is left untouched");
+	assert.equal(registry.listForeign().length, 1, "foreign pool tasks are visible (ADR-0007)");
+	assert.equal(registry.listForeign()[0].label, "foreign");
 	registry.kill(holder.id, "SIGKILL");
 	await waitFor(() => registry.status(holder.id)[0].status !== "running");
 	registry.dispose();
 });
 
-test("legacy manifests without ownerPid are adopted and re-owned", async () => {
-	// Pre-ownership artifacts (e.g. survivors started before the upgrade) must
-	// keep their re-adoption contract, and adoption transfers ownership so a
-	// later concurrent starter sees a live owner and stays out.
-	const shared = tempDir("det legacy-owner");
-	const registry = freshRegistry({ detachedDirPath: shared });
+test("legacy running manifests are foreign: visible, adoptable, never re-owned", async () => {
+	// Pre-subscription artifacts (started before the upgrade) carry no
+	// sessionId: they never auto-subscribe (ADR-0007) but stay visible in the
+	// pool and adoptable via adoptByPath — without an ownership rewrite.
+	const shared = tempDir("det legacy-foreign");
+	const registry = freshRegistry({ detachedDirPath: shared, sessionId: "sess-lg" });
 	const holder = registry.start({ command: "sleep 30", timeoutMs: 0 });
 	await waitFor(() => registry.status(holder.id)[0].status === "running");
 	const dir = join(shared, "s-legacy");
 	mkdirSync(dir, { recursive: true });
 	const manifestPath = join(dir, "legacy.json");
+	writeFileSync(join(dir, "o.log"), "");
 	writeFileSync(
 		manifestPath,
 		JSON.stringify({
@@ -588,14 +630,136 @@ test("legacy manifests without ownerPid are adopted and re-owned", async () => {
 			statusPath: join(dir, ".exit"),
 		}),
 	);
-	assert.equal(registry.adoptDetached(), 1, "no ownerPid — adoptable (legacy)");
-	const adopted = registry.status().find((task) => task.adopted);
-	assert.ok(adopted !== undefined);
+	assert.equal(registry.adoptDetached(), 0, "no sessionId — foreign, never auto-subscribed");
+	const foreign = registry.listForeign();
+	assert.equal(foreign.length, 1);
+	assert.equal(foreign[0].label, "legacy");
+	assert.equal(foreign[0].manifestPath, manifestPath);
+	const adopted = registry.adoptByPath(manifestPath);
+	assert.equal(adopted.adopted, true);
+	assert.equal(adopted.status, "running");
+	assert.ok(existsSync(join(dir, `legacy.sub.${process.pid}`)), "subscription marker written (wx)");
 	const after = JSON.parse(readFileSync(manifestPath, "utf8"));
-	assert.equal(after.ownerPid, process.pid, "adoption claims ownership on disk");
+	assert.equal(after.ownerPid, undefined, "adoption never rewrites ownership (ADR-0007)");
+	assert.equal(registry.listForeign().length, 0, "adopted — no longer foreign");
 	registry.kill(holder.id, "SIGKILL");
 	await waitFor(() => registry.status(holder.id)[0].status !== "running");
 	registry.dispose();
+});
+
+test("same-session survivors re-subscribe automatically; strangers must adopt explicitly", async () => {
+	const shared = tempDir("det session-scope");
+	const first = freshRegistry({ detachedDirPath: shared, sessionId: "sess-alpha" });
+	const snapshot = first.start({ command: "echo hi; sleep 5", detach: true });
+	await waitFor(() => (first.output(snapshot.id)?.stdoutTail ?? "") !== "", 5000);
+	first.dispose();
+	// Resumed conversation (pi -c / --resume / --session): same id → automatic.
+	const twin = freshRegistry({ adoptPollMs: 50, detachedDirPath: shared, sessionId: "sess-alpha" });
+	assert.equal(twin.adoptDetached(), 1, "same sessionId re-subscribes");
+	assert.equal(twin.status()[0].adopted, true);
+	twin.dispose();
+	// A different conversation: visible, manual adoption only (ADR-0007).
+	const stranger = freshRegistry({ adoptPollMs: 50, detachedDirPath: shared, sessionId: "sess-beta" });
+	assert.equal(stranger.adoptDetached(), 0, "foreign session never auto-subscribes");
+	const foreign = stranger.listForeign();
+	assert.equal(foreign.length, 1);
+	assert.equal(foreign[0].sessionId, "sess-alpha");
+	const adopted = stranger.adoptByPath(foreign[0].manifestPath);
+	assert.equal(adopted.status, "running");
+	stranger.kill(adopted.id, "SIGKILL");
+	await waitFor(() => stranger.status(adopted.id)[0].status !== "running", 15_000, 20);
+	stranger.dispose();
+});
+
+test("two subscribing sessions each receive the live pattern wake", async () => {
+	const shared = tempDir("det multi-sub");
+	const creator = freshRegistry({ adoptPollMs: 60_000, detachedDirPath: shared, sessionId: "sess-m0" });
+	creator.start({ command: "sleep 0.8; echo HIT; sleep 2", detach: true, pattern: { literal: "HIT" } });
+	const a = freshRegistry({ adoptPollMs: 50, detachedDirPath: shared, sessionId: "sess-ma" });
+	const b = freshRegistry({ adoptPollMs: 50, detachedDirPath: shared, sessionId: "sess-mb" });
+	const eventsA: RunningEvent[] = [];
+	const eventsB: RunningEvent[] = [];
+	a.onRunningEvent = (_snapshot, _output, event) => eventsA.push(event);
+	b.onRunningEvent = (_snapshot, _output, event) => eventsB.push(event);
+	// Subscribe both BEFORE the marker is written: the live match must fan out
+	// to every subscriber. (The stale replay is once per task — a later
+	// subscriber only recovers the count, per ADR-0006/0007 semantics.)
+	const listing = a.listForeign();
+	assert.equal(listing.length, 1);
+	a.adoptByPath(listing[0].manifestPath);
+	b.adoptByPath(listing[0].manifestPath);
+	await waitFor(() => eventsA.some((event) => event.kind === "pattern"), 15_000, 20);
+	await waitFor(() => eventsB.some((event) => event.kind === "pattern"), 15_000, 20);
+	assert.equal(eventsA[0]?.line, "HIT");
+	assert.equal(eventsB[0]?.line, "HIT");
+	a.kill(a.status()[0].id, "SIGKILL");
+	await waitFor(() => a.status()[0].status !== "running", 15_000, 20);
+	creator.dispose();
+	a.dispose();
+	b.dispose();
+});
+
+test("a pool kill is attributed to the killer in other subscribers' notices", async () => {
+	const shared = tempDir("det killby");
+	const creator = freshRegistry({ detachedDirPath: shared, sessionId: "sess-kc" });
+	creator.start({ command: "sleep 30", detach: true });
+	const watcher = freshRegistry({ adoptPollMs: 50, detachedDirPath: shared, sessionId: "sess-kw" });
+	const wakes: TaskSnapshot[] = [];
+	watcher.onExit = (finished) => wakes.push(finished);
+	const manifestPath = watcher.listForeign()[0].manifestPath;
+	watcher.adoptByPath(manifestPath);
+	creator.kill(creator.status()[0].id, "SIGKILL");
+	await waitFor(() => wakes.length === 1, 15_000, 20);
+	assert.equal(wakes[0].killedBy, "sess-kc", "foreign kill attributed cross-session (ADR-0007)");
+	creator.dispose();
+	watcher.dispose();
+});
+
+test("finished pool entries are collected once reported, unsubscribed, and creator gone", async () => {
+	const shared = tempDir("det collect");
+	const dead = spawnSync(process.execPath, ["-e", ""]); // a genuinely dead pid
+	const dir = join(shared, "s-old");
+	mkdirSync(dir, { recursive: true });
+	const manifestPath = join(dir, "old.json");
+	const writeCase = (reported: boolean) => {
+		writeFileSync(join(dir, "o.log"), "out");
+		writeFileSync(join(dir, "e.log"), "");
+		writeFileSync(join(dir, ".exit"), "0");
+		writeFileSync(
+			manifestPath,
+			JSON.stringify({
+				version: 1,
+				pid: dead.pid,
+				command: "true",
+				label: "old",
+				cwd: process.cwd(),
+				startedAt: Date.now() - 1000,
+				hostname: hostname(),
+				stdoutPath: join(dir, "o.log"),
+				stderrPath: join(dir, "e.log"),
+				statusPath: join(dir, ".exit"),
+				ownerPid: dead.pid,
+			}),
+		);
+		if (reported) writeFileSync(join(dir, "old.reported"), "");
+	};
+	// Unreported: registered + backfilled, artifacts stay for the reporter.
+	writeCase(false);
+	const first = freshRegistry({ detachedDirPath: shared, sessionId: "sess-c1" });
+	const wakes: number[] = [];
+	first.onExit = (finished) => wakes.push(finished.id);
+	first.adoptDetached();
+	assert.equal(wakes.length, 1, "unreported death backfills once");
+	assert.ok(existsSync(join(dir, "o.log")), "artifacts stay for the reporting session");
+	first.dispose();
+	// Next scanner: reported + no live subscribers + creator gone → collected.
+	const second = freshRegistry({ detachedDirPath: shared, sessionId: "sess-c2" });
+	second.adoptDetached();
+	assert.ok(!existsSync(manifestPath), "manifest collected");
+	assert.ok(!existsSync(join(dir, "o.log")), "output collected");
+	assert.ok(!existsSync(join(dir, ".exit")), "status collected");
+	assert.ok(!existsSync(join(dir, "old.reported")), "marker collected");
+	second.dispose();
 });
 
 test("toWslPath translates Windows drive paths and rejects the rest", () => {

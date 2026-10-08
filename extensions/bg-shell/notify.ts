@@ -180,7 +180,9 @@ export class CompletionNotifier {
 		const exit = task.exitCode !== null ? `exit ${task.exitCode}` : task.signal ? `signal ${task.signal}` : "no exit";
 		const duration = task.durationMs !== undefined ? `${(task.durationMs / 1000).toFixed(1)}s` : "?";
 		const pattern = task.pattern !== undefined && task.pattern.matches > 0 ? `, on_pattern ×${task.pattern.matches}` : "";
-		return `Background task #${task.id} ${STATUS_VERB[task.status]} (${exit}, ${duration}${pattern}): ${task.label}`;
+		const unattended = task.unattended ? ", unattended — finished while pi was away" : "";
+		const killedBy = task.killedBy !== undefined ? `, killed by ${task.killedBy}` : "";
+		return `Background task #${task.id} ${STATUS_VERB[task.status]} (${exit}, ${duration}${pattern}${unattended}${killedBy}): ${task.label}`;
 	}
 
 	private eventHeader(entry: DeliveryEntry): string {

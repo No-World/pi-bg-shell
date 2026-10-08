@@ -17,7 +17,7 @@ import { CompletionNotifier } from "./notify.ts";
 import { BgPanelComponent } from "./panel.ts";
 import { defaultTimeoutMsFromEnv, getSharedRegistry } from "./tasks.ts";
 import { BgStatusBar } from "./status-bar.ts";
-import { bashBgTool, bgKillTool, bgStatusTool } from "./tools.ts";
+import { bashBgTool, bgAdoptTool, bgKillTool, bgStatusTool } from "./tools.ts";
 
 export default function (pi: ExtensionAPI) {
 	// Env override is read once per process: the shared registry survives
@@ -50,12 +50,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool(bashBgTool({ registry, onChange: refreshStatus }));
 	pi.registerTool(bgStatusTool({ registry }));
 	pi.registerTool(bgKillTool({ registry, onChange: refreshStatus }));
+	pi.registerTool(bgAdoptTool({ registry, onChange: refreshStatus }));
 
 	pi.on("session_start", async (_event, ctx) => {
 		// Capture (or re-capture after reload) the UI surface for the widget.
 		statusBar.bindUi(ctx.hasUI ? ctx.ui : undefined);
-		// Re-adopt detached survivors from previous sessions (ADR-0006):
-		// alive ones resume tracking + notifications; dead ones register silently.
+		// Scan the global pool (ADR-0007): same-session survivors re-subscribe
+		// automatically, unreported deaths backfill once (merged), foreign
+		// tasks stay visible for explicit bg_adopt.
 		try {
 			registry.adoptDetached();
 		} catch {

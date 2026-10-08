@@ -20,8 +20,9 @@ Pi 内置的 `bash` 工具会阻塞整个 agent 轮次直到命令结束——�
 | 工具 | 作用 |
 |------|------|
 | `bash_bg` | 用 `bash -c` 后台执行命令，立即返回任务 id。每流 1 MiB 尾部缓冲捕获输出；超出即把全量历史溢写到文件。 |
-| `bg_status` | 列出全部任务的单行摘要，或按 id 取单个任务的完整状态与输出尾部。 |
-| `bg_kill` | 按 id 终止任务（默认 `SIGTERM`）。 |
+| `bg_status` | 列出全部任务的单行摘要，或按 id 取单个任务的完整状态与输出尾部。列表末尾附**全局池**分区：其他会话的脱离任务，可见但未认领。 |
+| `bg_kill` | 按 id 终止任务（默认 `SIGTERM`）。池任务的杀权归创建者或任一订阅者——即能在自己注册表里看到它的任何人。 |
+| `bg_adopt` | 按清单路径（来自 bg_status 全局池分区）把一个外来池任务订阅到本会话：完成通知、模式唤醒、杀权随之而来（ADR-0007）。 |
 
 完成通知以 `bg-shell-notify` 消息经 `pi.sendMessage({ triggerTurn: true })` 送进对话——与官方 file-trigger 示例、pi-subagents 的完成通知同一条唤醒原语。100 ms 窗口内的并发完成合并为一条消息，fan-out 不会冲垮会话。默认墙钟上限每任务 10 分钟（`timeout_sec` 可覆盖；`0` 关闭）。
 
@@ -46,7 +47,7 @@ Notify:  Background task #4 pattern match (on_pattern "ROOTED", match #1, runnin
 
 ### 脱离任务（活过 pi 退出）
 
-`bash_bg { detach: true }` 让命令在自己的 session（setsid）里跑，输出直写文件——退出 pi **不会杀它**（重启机器仍会）。真实退出码由包装层落盘；`tmpdir()/pi-bg-shell/` 下的清单让**下个 pi 会话自动领养**：活着的恢复跟踪（完成唤醒、on_pattern 继续监视），已死的静默登记终态供 bg_status 查。脱离任务默认不限时——需要限时就显式传 `timeout_sec`。
+`bash_bg { detach: true }` 让命令在自己的 session（setsid）里跑，输出直写文件——退出 pi **不会杀它**（重启机器仍会）。真实退出码由包装层落盘；`tmpdir()/pi-bg-shell/` 下的清单把根目录变成**机器级任务池**（ADR-0007）：同 session id 复活的会话（`pi -c` / `--resume`）自动重新订阅自己的幸存任务；其他会话在 bg_status 的全局池分区里看得见，用 `bg_adopt` 显式认领。无人见证的死亡由下一个扫描的会话**补发一次**（合并成一条、标注 `unattended — finished while pi was away`）——「跑完汇报」的承诺跨任何重启成立。脱离任务默认不限时——需要限时就显式传 `timeout_sec`。
 
 ```
 You:     把 24h 设备烤机跑起来，脱离，ROOTED 了叫我
@@ -57,7 +58,7 @@ Notify:  Background task #1 pattern match (on_pattern "ROOTED", match #1, runnin
 
 `bg_kill` 对脱离任务发整进程组信号。
 
-Windows 上 `bash` 通常是 WSL 中继，继承的 Windows 文件句柄跨不了这个边界——脱离任务在该平台改走 shell 自重定向（路径译为 `/mnt/<drive>/…`，`( cmd ) >> OUT 2>> ERR`），输出文件与退出码仍落在 `bg_status` 和下会话领养预期的位置。包装层本身以宿主侧脚本文件传递（`bash <file>`，不经 `-c` argv），退出码不会被 WSL 中继的参数重引号展开成 0。Windows 上 detached 中继改经 GUI 子系统的 wscript 启动器拉起——仅靠 `detached`+`windowsHide` 仍会弹控制台——因此启动零弹窗，且任务不再被「关闭终端窗口」连带杀死；`bg_kill` 在 Windows 上用 `taskkill /t /f` 整树终止（跨 WSL 边界没有 POSIX 信号语义）。自有脱离任务的 `on_pattern` 从第 0 字节起监视——启动早期的 milestone 同样会唤醒会话（领养任务另有全量回放）。任务池按 pi 进程隔离：清单记录属主进程，并存的 pi 进程不会碰属主存活的任务，只领养属主已消失的孤儿。
+Windows 上 `bash` 通常是 WSL 中继，继承的 Windows 文件句柄跨不了这个边界——脱离任务在该平台改走 shell 自重定向（路径译为 `/mnt/<drive>/…`，`( cmd ) >> OUT 2>> ERR`），输出文件与退出码仍落在 `bg_status` 和下会话领养预期的位置。包装层本身以宿主侧脚本文件传递（`bash <file>`，不经 `-c` argv），退出码不会被 WSL 中继的参数重引号展开成 0。Windows 上 detached 中继改经 GUI 子系统的 wscript 启动器拉起——仅靠 `detached`+`windowsHide` 仍会弹控制台——因此启动零弹窗，且任务不再被「关闭终端窗口」连带杀死；`bg_kill` 在 Windows 上用 `taskkill /t /f` 整树终止（跨 WSL 边界没有 POSIX 信号语义），并写入杀归因标记，让其他订阅者的通知注明凶手。自有脱离任务的 `on_pattern` 从第 0 字节起监视——启动早期的 milestone 同样会唤醒会话（认领任务另有全量回放）。任务池是公告板不是私有领地（ADR-0007）：每个会话都能看到每份清单；订阅是每 pid 一个独占创建的标记文件（并发会话无竞态）；工件只在任务终态、已汇报、无活订阅、创建进程消失后才被回收。
 
 ## 用户界面
 

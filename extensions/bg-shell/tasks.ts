@@ -25,12 +25,13 @@ import {
 	readdirSync,
 	readFileSync,
 	readSync,
+	realpathSync,
 	rmSync,
 	statSync,
 	writeSync,
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, sep } from "node:path";
 
 export type TaskStatus = "running" | "completed" | "failed" | "killed" | "timeout";
 
@@ -61,6 +62,26 @@ export interface RunningEvent {
 	stream?: "stdout" | "stderr";
 	line?: string;
 	matches?: number;
+}
+
+/** One scanned global-pool task (ADR-0007). */
+interface PoolEntry {
+	manifestPath: string;
+	manifest: DetachedManifest;
+	terminal: boolean;
+	reported: boolean;
+	liveSubscribers: number[];
+}
+
+/** A pool task this session does not track (bg_status foreign section / bg_adopt). */
+export interface ForeignTaskInfo {
+	manifestPath: string;
+	label: string;
+	command: string;
+	pid: number;
+	alive: boolean;
+	sessionId: string | undefined;
+	startedAt: number;
 }
 
 export interface StartParams {
@@ -100,6 +121,10 @@ export interface TaskSnapshot {
 	detached: boolean;
 	/** Adopted from a previous session's manifest. */
 	adopted: boolean;
+	/** Terminal state was backfilled by the pool (nobody watched it die; ADR-0007). */
+	unattended?: boolean;
+	/** Who killed the task, from the cross-session attribution marker (ADR-0007). */
+	killedBy?: string;
 	stdoutBytes: number;
 	stderrBytes: number;
 	stdoutTruncated: boolean;
@@ -248,6 +273,8 @@ export interface RegistryOptions {
 	adoptPollMs?: number;
 	/** Root dir for detached manifests/output. Default: tmpdir()/pi-bg-shell. Test seam. */
 	detachedDirPath?: string;
+	/** Session identity for pool auto re-subscription. Default: PI_SESSION_ID. Test seam (ADR-0007). */
+	sessionId?: string;
 	/** Injectable for tests. */
 	spawnFn?: typeof spawn;
 	now?: () => number;
@@ -309,6 +336,8 @@ export interface DetachedManifest {
 	launcherPath?: string;
 	/** Owning pi process; a live foreign owner keeps its pool private (ADR-0006). */
 	ownerPid?: number;
+	/** Creating-session identity (PI_SESSION_ID); same-id sessions re-subscribe automatically (ADR-0007). */
+	sessionId?: string;
 	pattern: { literal: string; all: boolean; fired: boolean } | undefined;
 }
 
@@ -412,6 +441,44 @@ function firedMarkerPath(manifestPath: string): string {
 	return manifestPath.replace(/\.json$/, ".fired");
 }
 
+/** One subscriber's claim on a pool task: <manifest>.json -> <manifest>.sub.<pid> (ADR-0007). */
+function subMarkerPath(manifestPath: string, pid: number): string {
+	return manifestPath.replace(/\.json$/, `.sub.${pid}`);
+}
+
+/** Pool-level "terminal state already reported" idempotence marker (ADR-0007). */
+function reportedMarkerPath(manifestPath: string): string {
+	return manifestPath.replace(/\.json$/, ".reported");
+}
+
+/** Cross-session kill attribution written by the killing session (ADR-0007). */
+function killedByMarkerPath(manifestPath: string): string {
+	return manifestPath.replace(/\.json$/, ".killedby");
+}
+
+/** Exclusive marker creation (0600): EEXIST counts as already-there; best effort. */
+function writeMarker(path: string, content = ""): boolean {
+	try {
+		const fd = openSync(path, "wx", 0o600);
+		try {
+			if (content !== "") writeSync(fd, content);
+		} finally {
+			closeSync(fd);
+		}
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function readMarker(path: string): string | undefined {
+	try {
+		return readFileSync(path, "utf8").trim();
+	} catch {
+		return undefined;
+	}
+}
+
 /** Exit code recorded by the detached wrapper's trailing printf; null = none yet. */
 function readExitCodeFile(path: string): number | null {
 	try {
@@ -450,6 +517,9 @@ function readManifest(path: string): DetachedManifest | undefined {
 			return undefined;
 		}
 		if (manifest.ownerPid !== undefined && typeof manifest.ownerPid !== "number") {
+			return undefined;
+		}
+		if (manifest.sessionId !== undefined && typeof manifest.sessionId !== "string") {
 			return undefined;
 		}
 		if (
@@ -583,6 +653,8 @@ interface TaskInternal {
 	killedByUser: boolean;
 	timedOut: boolean;
 	finalized: boolean;
+	unattendedBackfill: boolean;
+	unattendedFinishedAt: number | undefined;
 }
 
 export class TaskRegistry {
@@ -598,8 +670,18 @@ export class TaskRegistry {
 	/** Delivery-time events about still-running tasks (ADR-0005); rebound per load like onExit. */
 	public onRunningEvent: ((snapshot: TaskSnapshot, output: TaskOutput, event: RunningEvent) => void) | undefined;
 
+	private detachedPollTimer: ReturnType<typeof setInterval> | undefined;
+	private detachedSessionDir: string | undefined;
+	private readonly sessionIdValue: string;
+
 	constructor(options: RegistryOptions = {}) {
 		this.options = options;
+		this.sessionIdValue = (options.sessionId ?? process.env.PI_SESSION_ID ?? "").trim();
+	}
+
+	/** Our identity in the pool: the session id when one exists, else the pid. */
+	private selfLabel(): string {
+		return this.sessionIdValue !== "" ? this.sessionIdValue : `pid ${process.pid}`;
 	}
 
 	private get maxBufferBytes(): number {
@@ -697,6 +779,7 @@ export class TaskRegistry {
 				startedAt: this.now(),
 				hostname: hostname(),
 				ownerPid: process.pid,
+				sessionId: this.sessionIdValue !== "" ? this.sessionIdValue : undefined,
 				stdoutPath,
 				stderrPath,
 				statusPath,
@@ -790,6 +873,8 @@ export class TaskRegistry {
 				reportEveryMs,
 				detached: detach,
 				adopted: false,
+				unattended: false,
+				killedBy: undefined,
 				stdoutBytes: 0,
 				stderrBytes: 0,
 				stdoutTruncated: false,
@@ -814,6 +899,8 @@ export class TaskRegistry {
 			killedByUser: false,
 			timedOut: false,
 			finalized: false,
+			unattendedBackfill: false,
+			unattendedFinishedAt: undefined,
 		};
 		this.tasks.set(String(id), task);
 		this.order.push(task);
@@ -965,9 +1052,6 @@ export class TaskRegistry {
 
 	// --- Detached adoption (ADR-0006) -------------------------------------
 
-	private detachedPollTimer: ReturnType<typeof setInterval> | undefined;
-	private detachedSessionDir: string | undefined;
-
 	private ensureDetachedPoll(): void {
 		if (this.detachedPollTimer !== undefined || this.disposed) return;
 		const interval = Math.max(50, this.options.adoptPollMs ?? 2000);
@@ -1112,32 +1196,30 @@ export class TaskRegistry {
 	}
 
 	/**
-	 * Transfer a dead-owner (or legacy) manifest to this process: rm +
-	 * exclusive "wx" rewrite inside the trusted session dir. The exclusive
-	 * create is the claim — a concurrent pi that loses the race gets EEXIST,
-	 * re-reads, and sees our live pid, leaving us the sole adopter. A starter
-	 * that read the pre-claim bytes before our rm can still double-adopt in
-	 * that microsecond window (ADR-0006 notes the residual race); steady-state
-	 * isolation does not depend on winning it.
+	 * Subscribe this process to a pool task: an exclusive marker file, never a
+	 * manifest rewrite (ADR-0007). Subscription is additive and commutative —
+	 * concurrent subscribers each get their own marker and "losing a race"
+	 * does not exist; EEXIST simply means we already subscribe.
 	 */
-	private claimManifestOwnership(manifestPath: string, manifest: DetachedManifest): boolean {
-		manifest.ownerPid = process.pid;
+	private subscribe(manifestPath: string): void {
+		writeMarker(subMarkerPath(manifestPath, process.pid));
+	}
+
+	private unsubscribe(manifestPath: string): void {
 		try {
-			rmSync(manifestPath, { force: true });
-			const fd = openSync(manifestPath, "wx", 0o600);
-			try {
-				writeSync(fd, JSON.stringify(manifest, null, "\t"));
-			} finally {
-				closeSync(fd);
-			}
-			return true;
+			rmSync(subMarkerPath(manifestPath, process.pid), { force: true });
 		} catch {
-			return false; // lost the claim race (or fs hiccup) — treat as not ours
+			// Best effort only.
 		}
 	}
 
-	/** Register a task from a previous session's manifest; returns its snapshot. */
-	private registerAdopted(manifest: DetachedManifest, manifestPath: string, deadOnArrival: boolean): TaskSnapshot {
+	/** Register a task from the global pool; running adoptions subscribe (ADR-0007). */
+	private registerAdopted(
+		manifest: DetachedManifest,
+		manifestPath: string,
+		deadOnArrival: boolean,
+		notify: boolean,
+	): TaskSnapshot {
 		// An adoption-side .fired marker counts exactly like manifest.fired.
 		if (manifest.pattern !== undefined && existsSync(firedMarkerPath(manifestPath))) {
 			manifest.pattern.fired = true;
@@ -1165,6 +1247,8 @@ export class TaskRegistry {
 				reportEveryMs: undefined, // reports do not survive sessions; re-arm if needed
 				detached: true,
 				adopted: true,
+				unattended: deadOnArrival && notify,
+				killedBy: undefined,
 				stdoutBytes: statSize(manifest.stdoutPath),
 				stderrBytes: statSize(manifest.stderrPath),
 				stdoutTruncated: existsSync(manifest.stdoutPath),
@@ -1193,6 +1277,8 @@ export class TaskRegistry {
 			killedByUser: false,
 			timedOut: false,
 			finalized: false,
+			unattendedBackfill: deadOnArrival && notify,
+			unattendedFinishedAt: undefined,
 		};
 		this.tasks.set(String(id), task);
 		this.order.push(task);
@@ -1207,21 +1293,115 @@ export class TaskRegistry {
 			this.replayPatternHistory(task, !deadOnArrival);
 		}
 		if (deadOnArrival) {
-			// It died while no session watched: register the outcome silently.
-			const consumer = this.onExit;
-			this.onExit = undefined;
-			this.finalizeDetached(task, null);
-			this.onExit = consumer;
+			if (notify) {
+				// Pool-level death backfill (ADR-0007): deliver through the normal
+				// pipeline — the notifier's debounce merges a fan-out of stale
+				// deaths into one turn — annotated as unattended. Nobody witnessed
+				// the real death time; the exit file's mtime is the closest estimate.
+				try {
+					task.unattendedFinishedAt = statSync(manifest.statusPath).mtimeMs;
+				} catch {
+					// No status file (crash before the wrapper's printf): now is the estimate.
+				}
+				this.finalizeDetached(task, null);
+			} else {
+				// Already reported by an earlier scanner or the creator: register
+				// the outcome silently so bg_status can still query it.
+				const consumer = this.onExit;
+				this.onExit = undefined;
+				this.finalizeDetached(task, null);
+				this.onExit = consumer;
+			}
 		} else {
+			this.subscribe(manifestPath);
 			this.ensureDetachedPoll();
 		}
 		this.evictFinished();
 		return { ...task.snapshot };
 	}
 
-	/** Scan the manifest dir and re-adopt tasks from previous sessions. */
+	/** Scan the global pool: re-subscribe same-session survivors, backfill unreported deaths, collect the finished (ADR-0007). */
 	adoptDetached(): number {
 		if (this.disposed) return 0;
+		const known = this.knownManifestPaths();
+		let adopted = 0;
+		for (const entry of this.scanPool()) {
+			if (known.has(entry.manifestPath)) continue; // already tracked (post-reload)
+			const manifest = entry.manifest;
+			if (entry.terminal) {
+				const creatorAlive = manifest.ownerPid === process.pid || pidAlive(manifest.ownerPid);
+				if (entry.reported && entry.liveSubscribers.length === 0 && !creatorAlive) {
+					this.collectPoolEntry(entry);
+					continue;
+				}
+				// Death notices are pool-level duty (ADR-0007): one merged backfill
+				// per task, idempotent via the .reported marker — any session's scan
+				// delivers it, regardless of subscription.
+				this.registerAdopted(manifest, entry.manifestPath, true, !entry.reported);
+			} else if (
+				manifest.sessionId !== undefined &&
+				manifest.sessionId !== "" &&
+				manifest.sessionId === this.sessionIdValue
+			) {
+				// Same conversation identity (pi -c / --resume / --session): the
+				// resumed session IS the task's owner — re-subscribe automatically.
+				this.registerAdopted(manifest, entry.manifestPath, false, false);
+				adopted += 1;
+			}
+			// Else: foreign — another session's task or a legacy manifest. Visible
+			// via listForeign(), subscribed explicitly via adoptByPath (ADR-0007).
+		}
+		return adopted;
+	}
+
+	/** Pool tasks this session does not track: visible, adoptable, never auto-subscribed. */
+	listForeign(): ForeignTaskInfo[] {
+		const known = this.knownManifestPaths();
+		const out: ForeignTaskInfo[] = [];
+		for (const entry of this.scanPool()) {
+			if (known.has(entry.manifestPath)) continue;
+			out.push({
+				manifestPath: entry.manifestPath,
+				label: entry.manifest.label,
+				command: entry.manifest.command,
+				pid: entry.manifest.pid,
+				alive: !entry.terminal,
+				sessionId: entry.manifest.sessionId,
+				startedAt: entry.manifest.startedAt,
+			});
+		}
+		return out;
+	}
+
+	/** Explicitly subscribe to a foreign pool task (the bg_adopt tool, ADR-0007). */
+	adoptByPath(manifestPath: string): TaskSnapshot {
+		if (this.disposed) throw new Error("TaskRegistry is disposed");
+		const root = realpathSync(this.detachedRoot());
+		const resolved = realpathSync(dirname(manifestPath));
+		if (resolved !== root && !resolved.startsWith(`${root}${sep}`)) {
+			throw new Error(`not a pool manifest: ${manifestPath}`);
+		}
+		if (this.knownManifestPaths().has(manifestPath)) {
+			const existing = this.order.find((task) => task.detachedPaths?.manifestPath === manifestPath);
+			if (existing) return { ...existing.snapshot };
+		}
+		const manifest = readManifest(manifestPath);
+		if (manifest === undefined) throw new Error(`no valid manifest at ${manifestPath}`);
+		if (manifest.hostname !== hostname()) throw new Error("manifest belongs to another host");
+		const terminal = readExitCodeFile(manifest.statusPath) !== null || !pidAlive(manifest.pid);
+		const reported = existsSync(reportedMarkerPath(manifestPath));
+		return this.registerAdopted(manifest, manifestPath, terminal, terminal && !reported);
+	}
+
+	private knownManifestPaths(): Set<string> {
+		return new Set(
+			this.order
+				.map((task) => task.detachedPaths?.manifestPath)
+				.filter((path): path is string => path !== undefined),
+		);
+	}
+
+	private scanPool(): PoolEntry[] {
 		const root = this.detachedRoot();
 		let sessionDirs: string[];
 		try {
@@ -1229,25 +1409,19 @@ export class TaskRegistry {
 				.filter((entry) => entry.isDirectory())
 				.map((entry) => join(root, entry.name));
 		} catch {
-			return 0;
+			return [];
 		}
-		const known = new Set(
-			this.order
-				.map((task) => task.detachedPaths?.manifestPath)
-				.filter((path): path is string => path !== undefined),
-		);
-		let adopted = 0;
+		const entries: PoolEntry[] = [];
 		for (const dir of sessionDirs) {
-			let entries: string[];
+			let names: string[];
 			try {
-				entries = readdirSync(dir);
+				names = readdirSync(dir);
 			} catch {
 				continue;
 			}
-			for (const name of entries) {
+			for (const name of names) {
 				if (!name.endsWith(".json")) continue;
 				const manifestPath = join(dir, name);
-				if (known.has(manifestPath)) continue; // already tracked (post-reload)
 				const manifest = readManifest(manifestPath);
 				if (manifest === undefined) {
 					try {
@@ -1258,31 +1432,70 @@ export class TaskRegistry {
 					continue;
 				}
 				if (manifest.hostname !== hostname()) continue; // foreign tmp mount
-				// Pool ownership (ADR-0006): a manifest owned by a live foreign pi
-				// process belongs to that process's pool — skip it entirely (not
-				// listed, not reaped, not killed). Legacy manifests without
-				// ownerPid (pre-ownership artifacts) and dead-owner orphans stay
-				// adoptable so survivors keep their re-adoption contract.
-				if (
-					manifest.ownerPid !== undefined &&
-					manifest.ownerPid !== process.pid &&
-					pidAlive(manifest.ownerPid)
-				) {
-					continue;
+				const stem = name.slice(0, -".json".length);
+				const liveSubscribers: number[] = [];
+				const allSubscribers: number[] = [];
+				for (const other of names) {
+					if (!other.startsWith(`${stem}.sub.`)) continue;
+					const pid = Number(other.slice(stem.length + ".sub.".length));
+					if (!Number.isInteger(pid) || pid <= 0) continue;
+					allSubscribers.push(pid);
+					if (pid !== process.pid && pidAlive(pid)) liveSubscribers.push(pid);
 				}
-				if (!this.claimManifestOwnership(manifestPath, manifest)) continue;
-				if (!pidAlive(manifest.pid)) {
-					this.registerAdopted(manifest, manifestPath, true);
-					continue;
+				// Hygiene: markers of dead subscribers can never come back.
+				for (const pid of allSubscribers) {
+					if (pid !== process.pid && !pidAlive(pid)) {
+						try {
+							rmSync(subMarkerPath(manifestPath, pid), { force: true });
+						} catch {
+							// Best effort only.
+						}
+					}
 				}
-				this.registerAdopted(manifest, manifestPath, false);
-				adopted += 1;
+				entries.push({
+					manifestPath,
+					manifest,
+					terminal: readExitCodeFile(manifest.statusPath) !== null || !pidAlive(manifest.pid),
+					reported: existsSync(reportedMarkerPath(manifestPath)),
+					liveSubscribers,
+				});
 			}
 		}
-		return adopted;
+		return entries;
 	}
 
-	private removeManifest(task: TaskInternal): void {
+	/** Collect a finished pool entry: terminal, reported, unsubscribed, creator gone (ADR-0007). */
+	private collectPoolEntry(entry: PoolEntry): void {
+		const rm = (target: string | undefined) => {
+			if (target === undefined) return;
+			try {
+				rmSync(target, { force: true });
+			} catch {
+				// Best effort only.
+			}
+		};
+		rm(entry.manifest.stdoutPath);
+		rm(entry.manifest.stderrPath);
+		rm(entry.manifest.statusPath);
+		rm(entry.manifest.wrapperPath);
+		rm(entry.manifest.launcherPath);
+		rm(entry.manifestPath);
+		rm(firedMarkerPath(entry.manifestPath));
+		rm(reportedMarkerPath(entry.manifestPath));
+		rm(killedByMarkerPath(entry.manifestPath));
+		try {
+			const dir = dirname(entry.manifestPath);
+			const stem = basename(entry.manifestPath).replace(/\.json$/, "");
+			for (const name of readdirSync(dir)) {
+				if (name.startsWith(`${stem}.sub.`)) rm(join(dir, name));
+			}
+		} catch {
+			// Best effort only.
+		}
+	}
+
+	/** Detached artifacts outlive this session: close the held fd and drop our subscription only (ADR-0007). */
+	private unsubscribeDetached(task: TaskInternal): void {
 		if (task.detachedPaths === undefined) return;
 		if (task.detachedPaths.manifestFd !== undefined) {
 			try {
@@ -1292,18 +1505,7 @@ export class TaskRegistry {
 			}
 			task.detachedPaths.manifestFd = undefined;
 		}
-		try {
-			rmSync(task.detachedPaths.manifestPath, { force: true });
-			rmSync(firedMarkerPath(task.detachedPaths.manifestPath), { force: true });
-			if (task.detachedPaths.wrapperPath !== undefined) {
-				rmSync(task.detachedPaths.wrapperPath, { force: true });
-			}
-			if (task.detachedPaths.launcherPath !== undefined) {
-				rmSync(task.detachedPaths.launcherPath, { force: true });
-			}
-		} catch {
-			// Best effort only.
-		}
+		this.unsubscribe(task.detachedPaths.manifestPath);
 	}
 
 	private handlePatternMatch(task: TaskInternal, line: string, stream: "stdout" | "stderr"): void {
@@ -1355,8 +1557,16 @@ export class TaskRegistry {
 		const snapshot = task.snapshot;
 		snapshot.exitCode = code;
 		snapshot.signal = signal;
-		snapshot.finishedAt = this.now();
+		snapshot.finishedAt = task.unattendedFinishedAt ?? this.now();
 		snapshot.durationMs = snapshot.finishedAt - snapshot.startedAt;
+		snapshot.unattended = task.unattendedBackfill;
+		if (task.detachedPaths !== undefined) {
+			// A foreign kill's attribution marker must ride the delivered snapshot
+			// (ADR-0007) — read it BEFORE the onExit copy is made. Our own marker
+			// stays silent: the "killed" status already says it was us.
+			const by = readMarker(killedByMarkerPath(task.detachedPaths.manifestPath));
+			if (by !== undefined && by !== "" && by !== this.selfLabel()) snapshot.killedBy = by;
+		}
 		snapshot.status = task.killedByUser
 			? "killed"
 			: task.timedOut
@@ -1368,6 +1578,13 @@ export class TaskRegistry {
 			this.onExit?.({ ...snapshot }, this.outputFor(task));
 		} catch {
 			// A broken notifier must not break process teardown.
+		}
+		if (task.detachedPaths !== undefined && !this.disposed) {
+			// Pool-level terminal bookkeeping (ADR-0007): the death counts as
+			// reported (single-shot for later scanners). A disposed registry has
+			// no delivery path anymore — it must NOT claim reporting rights, or
+			// the death would be marked reported without ever reaching anyone.
+			writeMarker(reportedMarkerPath(task.detachedPaths.manifestPath));
 		}
 		this.evictFinished();
 	}
@@ -1414,6 +1631,12 @@ export class TaskRegistry {
 		const task = this.tasks.get(String(id));
 		if (!task || task.finalized) return task ? { ...task.snapshot } : undefined;
 		task.killedByUser = true;
+		if (task.detachedPaths !== undefined) {
+				// Cross-session attribution (ADR-0007): every other subscriber's
+				// completion notice will say who killed the task they watch. Our own
+				// notice stays clean — the "killed" status already says it was us.
+				writeMarker(killedByMarkerPath(task.detachedPaths.manifestPath), this.selfLabel());
+		}
 		this.signalChild(task, signal);
 		return { ...task.snapshot };
 	}
@@ -1443,13 +1666,17 @@ export class TaskRegistry {
 			this.tasks.delete(String(oldest.snapshot.id));
 			const index = this.order.indexOf(oldest);
 			if (index >= 0) this.order.splice(index, 1);
-			oldest.stdout.dispose();
-			oldest.stderr.dispose();
-			if (oldest.detachedPaths !== undefined) this.removeManifest(oldest);
+			if (oldest.detachedPaths !== undefined) {
+				// Terminal pool artifacts wait for scanner collection (ADR-0007).
+				this.unsubscribeDetached(oldest);
+			} else {
+				oldest.stdout.dispose();
+				oldest.stderr.dispose();
+			}
 		}
 	}
 
-	/** Drop all tracked state and delete spill files. Running detached tasks survive. */
+	/** Drop all tracked state and delete spill files. Detached tasks (running or terminal) keep their pool artifacts — collection is the scanner's duty (ADR-0007). */
 	dispose(): void {
 		this.disposed = true;
 		if (this.detachedPollTimer !== undefined) {
@@ -1479,9 +1706,15 @@ export class TaskRegistry {
 				// quit time — the OS reaps them with pi's process group.
 				this.signalChild(task, "SIGKILL");
 			}
+			if (detached) {
+				// Terminal pool artifacts outlive this session on purpose:
+				// unsubscribe only — the next scanner collects them once nobody
+				// reports or watches them anymore (ADR-0007).
+				this.unsubscribeDetached(task);
+				continue;
+			}
 			task.stdout.dispose();
 			task.stderr.dispose();
-			if (detached) this.removeManifest(task);
 		}
 		this.tasks.clear();
 		this.order.length = 0;

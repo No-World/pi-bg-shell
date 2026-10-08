@@ -1,14 +1,15 @@
 /**
  * Model-facing tool definitions for bg-shell.
  *
- * Three tools share the TaskRegistry: bash_bg starts a detached-from-turn
+ * Four tools share the TaskRegistry: bash_bg starts a detached-from-turn
  * child and returns immediately; bg_status inspects tasks and output tails;
- * bg_kill terminates one. All three run sequentially per Pi's contract for
+ * bg_kill terminates one; bg_adopt subscribes this session to a foreign
+ * global-pool task (ADR-0007). All run sequentially per Pi's contract for
  * tools sharing mutable in-memory state.
  */
 
 import { Type, type Static } from "typebox";
-import type { TaskOutput, TaskRegistry, TaskSnapshot, TaskStatus } from "./tasks.ts";
+import type { ForeignTaskInfo, TaskOutput, TaskRegistry, TaskSnapshot, TaskStatus } from "./tasks.ts";
 
 const BashBgParams = Type.Object({
 	command: Type.String({ description: "Shell command to run (executed with bash -c)." }),
@@ -51,7 +52,7 @@ const BashBgParams = Type.Object({
 	detach: Type.Optional(
 		Type.Boolean({
 			description:
-				"Run detached from the pi process: the task survives pi quitting (machine reboots still kill it). Output goes to files; the next pi session re-adopts it automatically. Timeout defaults to off.",
+				"Run detached from the pi process: the task survives pi quitting (machine reboots still kill it). Output goes to a machine-wide pool; a session resumed with the same session id re-subscribes automatically, any other session sees it in bg_status and can adopt it with bg_adopt. Timeout defaults to off.",
 		}),
 	),
 });
@@ -70,6 +71,13 @@ const BgKillParams = Type.Object({
 			description: "Termination signal. Default SIGTERM.",
 		}),
 	),
+});
+
+const BgAdoptParams = Type.Object({
+	path: Type.String({
+		description:
+			"Manifest path of a foreign global-pool task, as listed by bg_status's Global pool section (ADR-0007).",
+	}),
 });
 
 export interface BgToolDeps {
@@ -126,6 +134,7 @@ export interface BgStatusDetails {
 	task?: TaskSnapshot;
 	output?: TaskOutput | null;
 	tasks?: TaskSnapshot[];
+	foreign?: ForeignTaskInfo[];
 }
 
 export interface BgKillDetails {
@@ -265,14 +274,26 @@ export function bgStatusTool(deps: BgToolDeps) {
 				return { content: [{ type: "text" as const, text }], details: { task: snapshot, output: output ?? null } };
 			}
 			const snapshots = deps.registry.status();
-			if (snapshots.length === 0) {
+			const foreign = deps.registry.listForeign();
+			if (snapshots.length === 0 && foreign.length === 0) {
 				return {
 					content: [{ type: "text" as const, text: "No background tasks have been started in this session." }],
-					details: { tasks: [] },
+					details: { tasks: [], foreign: [] },
 				};
 			}
 			const lines = snapshots.map((task) => summaryLine(task, now));
-			return { content: [{ type: "text" as const, text: lines.join("\n") }], details: { tasks: snapshots } };
+			if (foreign.length > 0) {
+				lines.push(
+					"",
+					'Global pool (foreign — not adopted here; bg_adopt {"path": …} subscribes):',
+				);
+				for (const task of foreign) {
+					lines.push(
+						`- ${task.alive ? "running" : "terminal"} pid ${task.pid} · ${task.label} · ${task.manifestPath}`,
+					);
+				}
+			}
+			return { content: [{ type: "text" as const, text: lines.join("\n") }], details: { tasks: snapshots, foreign } };
 		},
 	};
 }
@@ -312,6 +333,50 @@ export function bgKillTool(deps: BgToolDeps) {
 			return {
 				content: [{ type: "text" as const, text: `Sent ${params.signal ?? "SIGTERM"} to task #${params.id} (${existing.label}).` }],
 				details: { id: params.id, signal: params.signal ?? "SIGTERM", killed: true },
+			};
+		},
+	};
+}
+
+export interface BgAdoptDetails {
+	id: number;
+	label: string;
+	status: TaskStatus;
+	manifestPath: string;
+}
+
+export function bgAdoptTool(deps: BgToolDeps) {
+	return {
+		name: "bg_adopt",
+		label: "Adopt pool task",
+		description:
+			"Subscribe this session to a detached task from the global pool that this session did not start " +
+			"(another session's task, or a legacy manifest). The adopted task gains wake rights here: completion " +
+			"notices, on_pattern matches, and death backfills. Kill rights belong to the creator or any subscriber.",
+		promptSnippet:
+			"bg_adopt — subscribe to a foreign pool task by manifest path (from bg_status's Global pool section); wakes and kill rights follow",
+		promptGuidelines: [
+			"bg_status lists foreign detached tasks under 'Global pool' — adopt one with bg_adopt before killing it or waiting on its output; same-session survivors are re-subscribed automatically and never need this.",
+		],
+		parameters: BgAdoptParams,
+		executionMode: "sequential" as const,
+		async execute(
+			_toolCallId: string,
+			params: Static<typeof BgAdoptParams>,
+			_signal: AbortSignal | undefined,
+			_onUpdate: unknown,
+			_ctx: unknown,
+		): Promise<{ content: { type: "text"; text: string }[]; details: BgAdoptDetails }> {
+			const snapshot = deps.registry.adoptByPath(params.path);
+			deps.onChange?.();
+			const text =
+				`Adopted pool task as #${snapshot.id} (${snapshot.label}) — ${snapshot.status === "running" ? "running; subscribed" : `terminal (${snapshot.status}${snapshot.exitCode !== null ? `, exit ${snapshot.exitCode}` : ""})`}. ` +
+				(snapshot.status === "running"
+					? "Completion and on_pattern wakes now arrive here; bg_kill can stop it."
+					: "Outcome registered; bg_status fetches the output.");
+			return {
+				content: [{ type: "text" as const, text }],
+				details: { id: snapshot.id, label: snapshot.label, status: snapshot.status, manifestPath: params.path },
 			};
 		},
 	};
