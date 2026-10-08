@@ -1,5 +1,7 @@
 # pi-bg-shell
 
+**English** | [简体中文](./README.zh-CN.md)
+
 Background shell tasks for the [Pi coding agent](https://github.com/earendil-works/pi) — Claude Code style: start a command, keep working, get the output delivered automatically when it exits.
 
 ```

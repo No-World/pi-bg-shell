@@ -1,5 +1,7 @@
 # pi-bg-shell
 
+[English](./README.md) | **简体中文**
+
 [Pi 编码 agent](https://github.com/earendil-works/pi) 的后台 shell 任务扩展——Claude Code 式体验：启动命令、继续干活、命令退出时输出自动送回。
 
 ```
