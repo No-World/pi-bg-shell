@@ -14,7 +14,8 @@ permissions:
 jobs:
   draft:
     name: create draft release
-    runs-on: ubuntu-latest
+        # Pinned: ubuntu-latest flips to Ubuntu 26 on 2026-10-19 — no toolchain shifts under a release.
+    runs-on: ubuntu-24.04
     steps:
       # --generate-notes diffs against the previous published release by
       # default — exactly the baseline we want; no checkout needed. The repo

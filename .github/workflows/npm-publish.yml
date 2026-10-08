@@ -21,7 +21,8 @@ permissions:
 jobs:
   publish:
     name: npm publish (trusted publishing)
-    runs-on: ubuntu-latest
+        # Pinned: ubuntu-latest flips to Ubuntu 26 on 2026-10-19 — no toolchain shifts under a release.
+    runs-on: ubuntu-24.04
     # Non-version releases never publish.
     if: startsWith(github.event.release.tag_name, 'v')
     steps:
