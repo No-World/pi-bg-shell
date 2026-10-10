@@ -4,6 +4,26 @@ Pi 编码 agent 的后台 shell 任务扩展。本文档是项目的**术语表�
 
 ## 任务与生命周期
 
+**解释器规格（ShellSpec）**：
+`bash_bg` / `powershell_bg` 实际使用的解释器描述：名称（bash/pwsh）、二进制路径、argv 前缀、**风味**（flavor：posix-bash / wsl-bash / windows-bash / powershell）。bash 的解析顺序镜像 pi 原生 `bash` 工具（shellPath → Git Bash → PATH），PowerShell 镜像原生 `powershell` 工具（pwsh 优先）；agent 通过挑工具选解释器，不存在 per-call 参数（ADR-0009）。
+_Avoid_: shell 参数/PI_BG_SHELL（都是被否决的方案：原生没有对应机制）、cmd（原生无 cmd 工具，明确不支持）。
+
+**WSL 中继**：
+PATH 上 `C:\Windows\System32\bash.exe` 的角色——把 Windows 侧 spawn 翻译进 WSL。作为 bash 解析的最后兜底（不再是 Windows 默认）；其 detached 路径需要 `/mnt/<drive>/` 路径翻译且包装层绝不能走 `-c` argv（P6）。
+_Avoid_: Windows bash（那会与 Git Bash/Cygwin/MSYS2 混淆——它们是 windows-bash 风味，无需翻译）。
+
+**windows 原生 bash（windows-bash）**：
+Git Bash / Cygwin / MSYS2 / 自定义 `shellPath` 一类——能直接寻址 `C:/…` 路径的原生 Windows bash；detached 包装层与 WSL 中继同形但零翻译（ADR-0009）。
+_Avoid_: Git Bash 专属（不止 Git Bash，Cygwin/MSYS2 同类）。
+
+**powershell_bg**：
+`bash_bg` 的 PowerShell 兄弟工具：仅 win32 注册、默认 inactive（与原生 `powershell` 同经 `defaultTools` 激活）、pwsh→powershell 回退、UTF-8 控制台头前置。detached 走静态 `.cmd` 包装 + `PI_BG_SHELL_CMD` 环境变量传命令（全程零动态引号）。
+_Avoid_: bash_bg 的 shell 参数（不存在；选解释器 = 挑工具）、cmd_bg（明确不做）。
+
+**PI_BG_SHELL_CMD**：
+pwsh detached 的命令传输通道：宿主在 spawn 环境里注入「UTF-8 头 + `& { 命令 }` + 退出码 trailer」的复合串，经 wscript → cmd → pwsh 一路继承，由固定串 `Invoke-Expression $env:PI_BG_SHELL_CMD` 执行——绕开整条链上的引号问题与 5.1 的 UTF-16 重定向坑（ADR-0009）。
+_Avoid_: argv 传参（P6 类风险就是它要消灭的）。
+
 **后台任务**：
 `bash_bg` 启动的一条 shell 子进程及其登记信息（id、pid、状态、输出缓冲、超时）。id 是进程内单调递增整数，对话中以 `#N` 指代。
 _Avoid_: 子 agent（那是 pi-subagents 的完整 agent 会话；后台任务是裸进程）、作业/job（统一叫任务）。

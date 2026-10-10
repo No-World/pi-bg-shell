@@ -4,7 +4,7 @@ import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { TaskRegistry } from "../extensions/bg-shell/tasks.ts";
-import { bashBgTool, bgAdoptTool, bgKillTool, bgStatusTool } from "../extensions/bg-shell/tools.ts";
+import { bashBgTool, bgAdoptTool, bgKillTool, bgStatusTool, powershellBgTool } from "../extensions/bg-shell/tools.ts";
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5000, stepMs = 10): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -20,6 +20,7 @@ interface RegisteredTool {
 	hasPrepareArguments: boolean;
 	hasPromptSnippet: boolean;
 	guidelineCount: number;
+	defaultActive: boolean | undefined;
 }
 
 /** Minimal structural stand-in for the ExtensionAPI registration surface. */
@@ -38,6 +39,7 @@ function stubPi() {
 				hasPrepareArguments: typeof tool.prepareArguments === "function",
 				hasPromptSnippet: typeof tool.promptSnippet === "string" && tool.promptSnippet.length > 0,
 				guidelineCount: Array.isArray(tool.promptGuidelines) ? tool.promptGuidelines.length : 0,
+				defaultActive: typeof tool.defaultActive === "boolean" ? tool.defaultActive : undefined,
 			});
 		},
 		on(event: string, handler: (event: unknown) => Promise<void> | void) {
@@ -49,14 +51,24 @@ function stubPi() {
 	};
 }
 
-test("extension entry registers four tools and a quit-only shutdown handler", async () => {
+test("extension entry registers the tool set and a quit-only shutdown handler", async () => {
 	const { default: factory } = await import("../extensions/bg-shell/index.ts");
 	const pi = stubPi();
 	factory(pi as never);
+	// win32 additionally exposes the native-parity powershell_bg sibling,
+	// inactive by default exactly like pi's optional powershell tool (ADR-0009).
+	const expected =
+		process.platform === "win32"
+			? ["bash_bg", "bg_adopt", "bg_kill", "bg_status", "powershell_bg"]
+			: ["bash_bg", "bg_adopt", "bg_kill", "bg_status"];
 	assert.deepEqual(
 		pi.tools.map((tool) => tool.name).sort(),
-		["bash_bg", "bg_adopt", "bg_kill", "bg_status"],
+		expected,
 	);
+	if (process.platform === "win32") {
+		const pwsh = pi.tools.find((tool) => tool.name === "powershell_bg");
+		assert.equal(pwsh?.defaultActive, false, "powershell_bg stays opt-in via defaultTools (ADR-0009)");
+	}
 	assert.ok(pi.tools.every((tool) => tool.hasExecute));
 	// Tools without a promptSnippet are omitted from the system prompt's
 	// Available-tools section and the model keeps reaching for bash instead —
@@ -193,4 +205,53 @@ test("registry dispose removes spill files from disk", async () => {
 	registry.dispose();
 	assert.deepEqual(registry.status(), []);
 	assert.ok(!existsSync(spill));
+});
+
+test("bash_bg prepends shellCommandPrefix and passes the resolved spec (native parity)", async () => {
+	const registry = new TaskRegistry({ killGraceMs: 100 });
+	const start = bashBgTool({
+		registry,
+		getSettings: () => ({ shellCommandPrefix: "export CI=1" }),
+		resolveBash: () => ({
+			name: "bash",
+			bin: "bash",
+			flavor: process.platform === "win32" ? "wsl-bash" : "posix-bash",
+			args: ["-c"],
+		}),
+	}) as unknown as { execute: (id: string, params: Record<string, unknown>) => Promise<{ content: { text: string }[] }> };
+	await start.execute("call-1", { command: "echo prefix-smoke", timeout_sec: 0 });
+	const snapshot = registry.status(1)[0];
+	assert.equal(snapshot.command, "export CI=1\necho prefix-smoke", "prefix joined with a newline, like native");
+	await waitFor(() => registry.status(1)[0].status !== "running");
+	assert.equal(registry.status(1)[0].status, "completed");
+	registry.dispose();
+});
+
+test("powershell_bg starts a task through the pwsh spec", async () => {
+	const starts: Array<Record<string, unknown>> = [];
+	const fakeRegistry = {
+		start: (params: Record<string, unknown>) => {
+			starts.push(params);
+			return { id: 1, pid: 123, label: "ps", command: params.command, shell: "pwsh", status: "running", timeoutMs: 0 };
+		},
+		status: () => [],
+		output: () => undefined,
+		kill: () => undefined,
+		listForeign: () => [],
+	} as unknown as TaskRegistry;
+	const tool = powershellBgTool({
+		registry: fakeRegistry,
+		resolvePowerShell: () => ({
+			name: "pwsh",
+			bin: "pwsh.exe",
+			flavor: "powershell",
+			args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"],
+		}),
+	}) as unknown as { execute: (id: string, params: Record<string, unknown>) => Promise<{ content: { text: string }[] }> };
+	const result = await tool.execute("call-1", { command: "Get-Date", timeout_sec: 12, detach: true });
+	assert.equal(starts.length, 1);
+	assert.equal((starts[0].shell as { name: string }).name, "pwsh");
+	assert.equal(starts[0].timeoutMs, 12000);
+	assert.equal(starts[0].detach, true);
+	assert.match(result.content[0].text, /Started background task #1 \(pwsh, pid 123\)/);
 });

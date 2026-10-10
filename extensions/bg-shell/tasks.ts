@@ -32,6 +32,14 @@ import {
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { basename, dirname, join, sep } from "node:path";
+import {
+	composeNormalCommand,
+	composePwshDetachedCommand,
+	PWSH_DETACHED_ENV,
+	PWSH_DETACHED_INNER,
+	resolveBashSpec,
+	type ShellSpec,
+} from "./shell.ts";
 
 export type TaskStatus = "running" | "completed" | "failed" | "killed" | "timeout";
 
@@ -97,12 +105,16 @@ export interface StartParams {
 	reportEveryMs?: number;
 	/** Detached: survive pi quitting, output to files, re-adopted next session (ADR-0006). */
 	detach?: boolean;
+	/** Interpreter spec; defaults to native-parity bash resolution (ADR-0009). */
+	shell?: ShellSpec;
 }
 
 export interface TaskSnapshot {
 	id: number;
 	label: string;
 	command: string;
+	/** Interpreter display name ("bash" | "pwsh"), ADR-0009. */
+	shell: string;
 	cwd: string;
 	pid: number | undefined;
 	status: TaskStatus;
@@ -277,6 +289,8 @@ export interface RegistryOptions {
 	sessionId?: string;
 	/** Injectable for tests. */
 	spawnFn?: typeof spawn;
+	/** Default shell resolution for bare start() calls; real resolution mirrors pi native (ADR-0009). */
+	resolveShell?: () => ShellSpec;
 	now?: () => number;
 }
 
@@ -332,8 +346,10 @@ export interface DetachedManifest {
 	statusPath: string;
 	/** Windows+WSL only: host-written wrapper script — keeps "$?" out of argv (PITFALLS P6). */
 	wrapperPath?: string;
-	/** Windows+WSL only: wscript launcher — the only popup-free detached spawn (PITFALLS P8). */
+	/** Windows only: wscript launcher — the only popup-free detached spawn (PITFALLS P8). */
 	launcherPath?: string;
+	/** Interpreter family this task runs under; absent (legacy manifests) means bash (ADR-0009). */
+	shell?: string;
 	/** Owning pi process; a live foreign owner keeps its pool private (ADR-0006). */
 	ownerPid?: number;
 	/** Creating-session identity (PI_SESSION_ID); same-id sessions re-subscribe automatically (ADR-0007). */
@@ -381,6 +397,11 @@ export function toWslPath(path: string): string | undefined {
 	return `/mnt/${match[1].toLowerCase()}/${match[2].replace(/\\/g, "/")}`;
 }
 
+/** Backslash → forward-slash Windows path ("C:\\a\\b" → "C:/a/b") — native to Git Bash, Cygwin, and MSYS2 alike. */
+function toWindowsSlashPath(path: string): string {
+	return path.replace(/\\/g, "/");
+}
+
 /**
  * Windows+WSL detached wrapper: WSL does not translate inherited Windows
  * file handles (an fd passed to spawn lands on the console), so the shell
@@ -403,18 +424,59 @@ export function buildWslDetachedWrapper(
 	);
 }
 
+/** Quote one token for a VBScript shell.Run line. */
+export function vbsQuoted(value: string): string {
+	return `Chr(34) & "${value}" & Chr(34)`;
+}
+
 /**
- * Windows+WSL launcher script (VBScript): wscript is a GUI-subsystem binary,
- * so it never owns a console — DETACHED_PROCESS has nothing to pop a window
- * for — and Run(..., 0, True) starts the relay hidden and waits, keeping our
- * child handle alive for the close event. A side benefit over a detached
- * console child: closing the hosting terminal cannot kill the tree anymore,
- * because there is no console to receive the close event (PITFALLS P8).
+ * Popup-free hidden launcher (PITFALLS P8): wscript is a GUI-subsystem
+ * binary, so it never owns a console — DETACHED_PROCESS has nothing to pop a
+ * window for — and Run(..., 0, True) starts the payload hidden and waits,
+ * keeping our child handle alive for the close event. A side benefit over a
+ * detached console child: closing the hosting terminal cannot kill the tree
+ * anymore, because there is no console to receive the close event.
  */
-export function buildWslDetachedLauncher(wrapperWslPath: string): string {
+export function buildHiddenRunLauncher(runLine: string): string {
+	return `Set shell = CreateObject("WScript.Shell")\r\nshell.Run ${runLine}, 0, True\r\n`;
+}
+
+/**
+ * Windows-native bash detached wrapper (Git Bash/Cygwin/MSYS2 — ADR-0009):
+ * unlike the WSL relay these address C:/ paths directly, so no /mnt
+ * translation — only backslashes become forward slashes. Same shape as the
+ * WSL wrapper otherwise (exit code via the trailing printf, out of argv).
+ */
+export function buildWindowsBashDetachedWrapper(
+	command: string,
+	redirects: { stdoutPath: string; stderrPath: string; statusPath: string },
+): string {
 	return (
-		`Set shell = CreateObject("WScript.Shell")\r\n` +
-		`shell.Run "bash " & Chr(34) & "${wrapperWslPath}" & Chr(34), 0, True\r\n`
+		`( ${command}\n) >> ${shellSingleQuote(toWindowsSlashPath(redirects.stdoutPath))}` +
+		` 2>> ${shellSingleQuote(toWindowsSlashPath(redirects.stderrPath))}` +
+		`\nprintf '%s\\n' "$?" > ${shellSingleQuote(toWindowsSlashPath(redirects.statusPath))}`
+	);
+}
+
+/**
+ * PowerShell detached wrapper, cmd flavor (ADR-0009). wscript runs this
+ * hidden. cmd's 1>>/2>> are RAW byte appends — PowerShell's own >> writes
+ * UTF-16LE+BOM on 5.1 (measured), which would poison UTF-8 tails and
+ * on_pattern matching. The pwsh invocation is a FIXED string: the command
+ * itself travels through PI_BG_SHELL_CMD, so no quoting anywhere on the
+ * wscript → cmd → pwsh chain. The parenthesized (echo %ERRORLEVEL%) keeps
+ * cmd from parsing a leading exit-code digit as a stream redirect.
+ */
+export function buildPwshDetachedWrapperCmd(
+	bin: string,
+	redirects: { stdoutPath: string; stderrPath: string; statusPath: string },
+): string {
+	return (
+		`@echo off\r\n` +
+		`"${bin}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "${PWSH_DETACHED_INNER}"` +
+		` 1>>"${redirects.stdoutPath}" 2>>"${redirects.stderrPath}"\r\n` +
+		`(echo %ERRORLEVEL%)>"${redirects.statusPath}"\r\n` +
+		`exit /b %ERRORLEVEL%\r\n`
 	);
 }
 
@@ -520,6 +582,9 @@ function readManifest(path: string): DetachedManifest | undefined {
 			return undefined;
 		}
 		if (manifest.sessionId !== undefined && typeof manifest.sessionId !== "string") {
+			return undefined;
+		}
+		if (manifest.shell !== undefined && typeof manifest.shell !== "string") {
 			return undefined;
 		}
 		if (
@@ -734,6 +799,18 @@ export class TaskRegistry {
 		return this.spillDir;
 	}
 
+	/** Write a per-task hidden-launcher VBS; returns its path (PITFALLS P8, ADR-0009). */
+	private writeHiddenLauncher(ddir: string, token: string, runLine: string): string {
+		const launcherPath = join(ddir, `${token}.launcher.vbs`);
+		const fd = openSync(launcherPath, "wx", 0o600);
+		try {
+				writeSync(fd, buildHiddenRunLauncher(runLine));
+		} finally {
+			closeSync(fd);
+		}
+		return launcherPath;
+	}
+
 	start(params: StartParams): TaskSnapshot {
 		if (this.disposed) throw new Error("TaskRegistry is disposed");
 		const command = params.command?.trim();
@@ -755,6 +832,7 @@ export class TaskRegistry {
 		const id = this.nextId++;
 		const dir = this.ensureSpillDir();
 		const spawnFn = this.options.spawnFn ?? spawn;
+		const spec = params.shell ?? (this.options.resolveShell ?? resolveBashSpec)();
 		const env = { ...process.env, ...(params.env ?? {}) };
 
 		// Detached artifacts: output files + exit-status file + manifest (ADR-0006).
@@ -768,7 +846,7 @@ export class TaskRegistry {
 			const stdoutPath = join(ddir, `${token}.stdout.log`);
 			const stderrPath = join(ddir, `${token}.stderr.log`);
 			const statusPath = join(ddir, `${token}.exit`);
-			const wrapperPath = join(ddir, `${token}.wrapper.sh`);
+			const wrapperPath = join(ddir, `${token}.wrapper.${spec.flavor === "powershell" ? "cmd" : "sh"}`);
 			const manifestPath = join(ddir, `${token}.json`);
 			manifest = {
 				version: 1,
@@ -778,6 +856,7 @@ export class TaskRegistry {
 				cwd,
 				startedAt: this.now(),
 				hostname: hostname(),
+				shell: spec.name,
 				ownerPid: process.pid,
 				sessionId: this.sessionIdValue !== "" ? this.sessionIdValue : undefined,
 				stdoutPath,
@@ -787,14 +866,14 @@ export class TaskRegistry {
 					? { literal: params.pattern.literal, all: params.pattern.all ?? false, fired: false }
 					: undefined,
 			};
-			if (process.platform === "win32") {
+			if (spec.flavor === "wsl-bash") {
 				// WSL bash.exe cannot address Windows paths; fail fast before any
 				// artifact exists rather than run a task whose output and exit
 				// status can never be recorded (#15).
 				for (const path of [stdoutPath, stderrPath, statusPath, wrapperPath]) {
 					if (toWslPath(path) === undefined) {
 						throw new Error(
-							`detached on Windows needs drive-letter paths for WSL translation (got ${path})`,
+							`detached WSL tasks need drive-letter paths for translation (got ${path})`,
 						);
 					}
 				}
@@ -816,18 +895,35 @@ export class TaskRegistry {
 					closeSync(wrapperFd);
 				}
 				manifest.wrapperPath = wrapperPath;
-				// Popup-free detached spawn: windowsHide (CREATE_NO_WINDOW) loses
-				// against detached (DETACHED_PROCESS) for console children, so the
-				// bash relay must be started by a GUI-subsystem launcher instead
-				// (PITFALLS P8).
-				const launcherPath = join(ddir, `${token}.launcher.vbs`);
-				const launcherFd = openSync(launcherPath, "wx", 0o600);
-				try {
-					writeSync(launcherFd, buildWslDetachedLauncher(toWslPath(wrapperPath) as string));
-				} finally {
-					closeSync(launcherFd);
+				manifest.launcherPath = this.writeHiddenLauncher(
+					ddir,
+					token,
+					`${vbsQuoted(spec.bin)} & " " & ${vbsQuoted(toWslPath(wrapperPath) as string)}`,
+				);
+			} else if (spec.flavor === "windows-bash" || spec.flavor === "powershell") {
+				// Native-Windows interpreters address C:\ paths directly — no
+				// /mnt translation (ADR-0009). All win32 flavors still need the
+				// GUI launcher: DETACHED_PROCESS pops a visible console for console
+				// children regardless of windowsHide (PITFALLS P8).
+				let wrapper: string;
+				if (spec.flavor === "powershell") {
+					wrapper = buildPwshDetachedWrapperCmd(spec.bin, { stdoutPath, stderrPath, statusPath });
+					env[PWSH_DETACHED_ENV] = composePwshDetachedCommand(command);
+				} else {
+					wrapper = buildWindowsBashDetachedWrapper(command, { stdoutPath, stderrPath, statusPath });
 				}
-				manifest.launcherPath = launcherPath;
+				const wrapperFd = openSync(wrapperPath, "wx", 0o600);
+				try {
+					writeSync(wrapperFd, wrapper);
+				} finally {
+					closeSync(wrapperFd);
+				}
+				manifest.wrapperPath = wrapperPath;
+				const runLine =
+					spec.flavor === "powershell"
+						? `${vbsQuoted(env.ComSpec ?? "cmd.exe")} & " /c " & ${vbsQuoted(wrapperPath)}`
+						: `${vbsQuoted(spec.bin)} & " " & ${vbsQuoted(wrapperPath)}`;
+				manifest.launcherPath = this.writeHiddenLauncher(ddir, token, runLine);
 			} else {
 				outFd = openSync(stdoutPath, "wx", 0o600);
 				try {
@@ -859,6 +955,7 @@ export class TaskRegistry {
 				id,
 				label,
 				command,
+				shell: spec.name,
 				cwd,
 				pid: undefined,
 				status: "running",
@@ -907,13 +1004,13 @@ export class TaskRegistry {
 
 		let child: ChildProcess;
 		try {
-			if (detach && detachedPaths && process.platform === "win32") {
-				// Paths were validated as translatable before any artifact was
-				// created, and the launcher file was written in that same block,
-				// so the assertion is structural only. wscript.exe is a
-				// GUI-subsystem binary: detached cannot give it a console, so
-				// nothing pops a window, and its Run(…, True) waits for the relay
-				// tree, keeping our close event meaningful (PITFALLS P8).
+			if (detach && detachedPaths && spec.flavor !== "posix-bash") {
+				// Paths were validated before any artifact was created, and the
+				// launcher file was written in that same block, so the assertion is
+				// structural only. wscript.exe is a GUI-subsystem binary: detached
+				// cannot give it a console, so nothing pops a window, and its
+				// Run(…, True) waits for the payload tree, keeping our close event
+				// meaningful (PITFALLS P8).
 				child = spawnFn("wscript.exe", ["//B", "//Nologo", detachedPaths.launcherPath as string], {
 					cwd,
 					env,
@@ -926,7 +1023,7 @@ export class TaskRegistry {
 				// bash itself always exits 0 after its printf (ADR-0006).
 				const wrapped =
 					`( ${command}\n)\nprintf '%s\\n' "$?" > ${shellSingleQuote(detachedPaths.statusPath)}`;
-				child = spawnFn("bash", ["-c", wrapped], {
+				child = spawnFn(spec.bin, [...spec.args, wrapped], {
 					cwd,
 					env,
 					detached: true, // setsid: new process group, survives pi
@@ -934,9 +1031,10 @@ export class TaskRegistry {
 					windowsHide: true,
 				});
 			} else {
-				// windowsHide: on win32 every bash is the WSL relay — a console
-				// subsystem child would otherwise pop a window per spawn.
-				child = spawnFn("bash", ["-c", command], {
+				// Native parity (ADR-0009): resolved interpreter + its fixed argv
+				// prefix + the command; windowsHide keeps console-subsystem
+				// children (WSL relay, Git Bash, pwsh) popup-free.
+				child = spawnFn(spec.bin, [...spec.args, composeNormalCommand(spec, command)], {
 					cwd,
 					env,
 					stdio: ["ignore", "pipe", "pipe"],
@@ -1230,6 +1328,7 @@ export class TaskRegistry {
 				id,
 				label: manifest.label,
 				command: manifest.command,
+				shell: manifest.shell ?? "bash",
 				cwd: manifest.cwd,
 				pid: manifest.pid,
 				status: "running",

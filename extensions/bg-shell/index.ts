@@ -17,7 +17,7 @@ import { CompletionNotifier } from "./notify.ts";
 import { BgPanelComponent } from "./panel.ts";
 import { defaultTimeoutMsFromEnv, getSharedRegistry } from "./tasks.ts";
 import { BgStatusBar } from "./status-bar.ts";
-import { bashBgTool, bgAdoptTool, bgKillTool, bgStatusTool } from "./tools.ts";
+import { bashBgTool, bgAdoptTool, bgKillTool, bgStatusTool, powershellBgTool } from "./tools.ts";
 
 export default function (pi: ExtensionAPI) {
 	// Env override is read once per process: the shared registry survives
@@ -47,10 +47,18 @@ export default function (pi: ExtensionAPI) {
 
 	const refreshStatus = () => statusBar.refresh(registry.status());
 
-	pi.registerTool(bashBgTool({ registry, onChange: refreshStatus }));
+	pi.registerTool(
+		bashBgTool({ registry, onChange: refreshStatus, getSettings: () => pi.getSettings() }),
+	);
 	pi.registerTool(bgStatusTool({ registry }));
 	pi.registerTool(bgKillTool({ registry, onChange: refreshStatus }));
 	pi.registerTool(bgAdoptTool({ registry, onChange: refreshStatus }));
+	if (process.platform === "win32") {
+		// Native parity (ADR-0009): the optional powershell tool exists on win32
+		// only and stays inactive until defaultTools enables it — one settings
+		// line ("+powershell", "+powershell_bg") lights up foreground + background.
+		pi.registerTool(powershellBgTool({ registry, onChange: refreshStatus }));
+	}
 
 	pi.on("session_start", async (_event, ctx) => {
 		// Capture (or re-capture after reload) the UI surface for the widget.

@@ -348,7 +348,13 @@ test("win32 detached spawns the relay through a hidden wscript launcher", { skip
 		return fakeChild;
 	}) as unknown as typeof spawnType;
 	const registry = freshRegistry({ detachedDirPath: dir, spawnFn: fakeSpawn });
-	registry.start({ command: "exit 42", detach: true, timeoutMs: 0 });
+	// Explicit WSL-relay spec: deterministic regardless of the host's Git Bash.
+	registry.start({
+		command: "exit 42",
+		detach: true,
+		timeoutMs: 0,
+		shell: { name: "bash", bin: "C:\\Windows\\System32\\bash.exe", flavor: "wsl-bash", args: ["-c"] },
+	});
 	assert.ok(args !== undefined, "spawn was called");
 	assert.equal(args[0], "//B");
 	assert.equal(args[1], "//Nologo");
@@ -360,8 +366,10 @@ test("win32 detached spawns the relay through a hidden wscript launcher", { skip
 	assert.equal(opts?.windowsHide, true);
 	// The launcher starts the relay hidden and waits for it.
 	const launcher = readFileSync(launcherPath, "utf8");
-	const run = /shell\.Run "bash " & Chr\(34\) & "(.*?)" & Chr\(34\), 0, True/.exec(launcher);
-	assert.ok(run !== null, "launcher runs bash hidden and waits");
+	const run = /shell\.Run Chr\(34\) & "C:\\Windows\\System32\\bash\.exe" & Chr\(34\) & " " & Chr\(34\) & "(.*?)" & Chr\(34\), 0, True/.exec(
+		launcher,
+	);
+	assert.ok(run !== null, "launcher runs the resolved relay hidden and waits");
 	assert.match(run[1]!, /^\/mnt\/[a-z]\//, "launcher targets the WSL wrapper path");
 	// The wrapper content keeps "$?" out of the relay's argv (P6).
 	const drive = /^\/mnt\/([a-z])\/(.*)$/.exec(run[1]!);
@@ -805,4 +813,114 @@ test("defaultTimeoutMsFromEnv parses PI_BG_SHELL_TIMEOUT_SEC with safe fallbacks
 			`${bad} → fallback`,
 		);
 	}
+});
+
+test("windows-bash detached writes a forward-slash wrapper and a full-bin launcher", () => {
+	// ADR-0009: Git Bash/Cygwin/MSYS2 address C:/ paths directly — the wrapper
+	// keeps bash syntax but needs no /mnt translation, and the launcher embeds
+	// the resolved interpreter (it may not be on PATH).
+	const dir = tempDir("det winbash");
+	let args: string[] | undefined;
+	const fakeChild = { pid: 4242, unref: (): void => {}, on: (): unknown => fakeChild };
+	const fakeSpawn = ((_cmd: string, argv: string[]) => {
+		args = argv;
+		return fakeChild;
+	}) as unknown as typeof spawnType;
+	const registry = freshRegistry({ detachedDirPath: dir, spawnFn: fakeSpawn });
+	const gitBash = "C:\\Program Files\\Git\\bin\\bash.exe";
+	const snapshot = registry.start({
+		command: "exit 5",
+		detach: true,
+		timeoutMs: 0,
+		shell: { name: "bash", bin: gitBash, flavor: "windows-bash", args: ["-c"] },
+	});
+	assert.equal(snapshot.shell, "bash");
+	assert.ok(args !== undefined && /\.launcher\.vbs$/.test(args[2] as string));
+	const launcherPath = args![2]!;
+	const launcher = readFileSync(launcherPath, "utf8");
+	const run = new RegExp(
+		`shell\\.Run Chr\\(34\\) & "${gitBash.replace(/\\/g, "\\\\")}" & Chr\\(34\\) & " " & Chr\\(34\\) & "(.*?)" & Chr\\(34\\), 0, True`,
+	).exec(launcher);
+	assert.ok(run !== null, "launcher runs the resolved Git Bash hidden and waits");
+	const wrapperPath = run[1]!;
+	assert.ok(!wrapperPath.startsWith("/mnt/"), "no WSL translation for native Windows bash");
+	const wrapper = readFileSync(wrapperPath, "utf8");
+	assert.ok(wrapper.includes(`printf '%s\\n' "$?"`), "exit code recorded inside the file (P6 shape)");
+	assert.ok(/>> '.*stdout\.log'/.test(wrapper), "redirects use forward-slash Windows paths");
+	const manifestName = readdirSync(dirname(wrapperPath)).find((name) => name.endsWith(".json"));
+	const manifest = JSON.parse(readFileSync(join(dirname(wrapperPath), manifestName!), "utf8"));
+	assert.equal(manifest.shell, "bash");
+	registry.dispose();
+});
+
+test("powershell detached rides PI_BG_SHELL_CMD through a cmd wrapper", () => {
+	// ADR-0009: the command travels as an env var — the wrapper is a fully
+	// static template (no quoting anywhere on the wscript → cmd → pwsh chain),
+	// and cmd's raw-byte 1>>/2>> bypass PowerShell 5.1's UTF-16LE >>.
+	const dir = tempDir("det pwsh");
+	let spawnOptions: Record<string, unknown> | undefined;
+	let args: string[] | undefined;
+	const fakeChild = { pid: 4242, unref: (): void => {}, on: (): unknown => fakeChild };
+	const fakeSpawn = ((_cmd: string, argv: string[], options: object) => {
+		args = argv;
+		spawnOptions = options as Record<string, unknown>;
+		return fakeChild;
+	}) as unknown as typeof spawnType;
+	const registry = freshRegistry({ detachedDirPath: dir, spawnFn: fakeSpawn });
+	const pwshBin = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
+	const snapshot = registry.start({
+		command: "Write-Output secret-payload",
+		detach: true,
+		timeoutMs: 0,
+		shell: { name: "pwsh", bin: pwshBin, flavor: "powershell", args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"] },
+	});
+	assert.equal(snapshot.shell, "pwsh");
+	assert.ok(args !== undefined && /\.launcher\.vbs$/.test(args[2] as string));
+	const launcher = readFileSync(args![2]!, "utf8");
+	assert.match(launcher, /shell\.Run Chr\(34\) & ".*cmd\.exe" & Chr\(34\) & " \/c " & Chr\(34\)/, "launcher goes through cmd /c");
+	// Detached artifacts live in a per-session mkdtemp dir under the root.
+	const sessionDir = join(dir, readdirSync(dir)[0]!);
+	const wrapperPath = readdirSync(sessionDir).find((name) => name.endsWith(".wrapper.cmd"));
+	assert.ok(wrapperPath !== undefined, "pwsh detached wrapper is a .cmd file");
+	const wrapper = readFileSync(join(sessionDir, wrapperPath!), "utf8");
+	assert.ok(wrapper.startsWith("@echo off\r\n"), "CRLF batch file");
+	assert.ok(wrapper.includes('"Invoke-Expression $env:PI_BG_SHELL_CMD"'), "fixed inner invocation");
+	assert.ok(wrapper.includes("1>>\"") && wrapper.includes("2>>\""), "raw byte redirects");
+	assert.ok(wrapper.includes("(echo %ERRORLEVEL%)>\""), "status write survives cmd expansion rules");
+	assert.ok(!wrapper.includes("secret-payload"), "the command itself never lands in the wrapper");
+	const env = spawnOptions?.env as Record<string, string>;
+	assert.ok(env?.PI_BG_SHELL_CMD.includes("secret-payload"), "the command rides the env var");
+	assert.ok(env?.PI_BG_SHELL_CMD.includes("& { Write-Output secret-payload"));
+	assert.ok(env?.PI_BG_SHELL_CMD.includes("elseif (Test-Path variable:LASTEXITCODE)"), "exit-code trailer attached");
+	const manifestName = readdirSync(sessionDir).find((name) => name.endsWith(".json"));
+	const manifest = JSON.parse(readFileSync(join(sessionDir, manifestName!), "utf8"));
+	assert.equal(manifest.shell, "pwsh");
+	registry.dispose();
+});
+
+test("powershell normal tasks spawn with the native argv and UTF-8 prefix", () => {
+	const calls: Array<{ cmd: string; args: string[]; opts: Record<string, unknown> }> = [];
+	const fakeChild = { pid: 4242, unref: (): void => {}, on: (): unknown => fakeChild };
+	const fakeSpawn = ((cmd: string, argv: string[], options: object) => {
+		calls.push({ cmd, args: argv, opts: options as Record<string, unknown> });
+		return fakeChild;
+	}) as unknown as typeof spawnType;
+	const registry = freshRegistry({ spawnFn: fakeSpawn });
+	registry.start({
+		command: "Write-Output hi",
+		timeoutMs: 0,
+		shell: { name: "pwsh", bin: "pwsh.exe", flavor: "powershell", args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"] },
+	});
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0].cmd, "pwsh.exe");
+	assert.deepEqual(calls[0].args, [
+		"-NoProfile",
+		"-NonInteractive",
+		"-ExecutionPolicy",
+		"Bypass",
+		"-Command",
+		"try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\nWrite-Output hi",
+	]);
+	assert.equal(calls[0].opts.windowsHide, true);
+	registry.dispose();
 });

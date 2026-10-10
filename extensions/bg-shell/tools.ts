@@ -1,7 +1,7 @@
 /**
  * Model-facing tool definitions for bg-shell.
  *
- * Four tools share the TaskRegistry: bash_bg starts a detached-from-turn
+ * Five tools share the TaskRegistry: bash_bg starts a detached-from-turn
  * child and returns immediately; bg_status inspects tasks and output tails;
  * bg_kill terminates one; bg_adopt subscribes this session to a foreign
  * global-pool task (ADR-0007). All run sequentially per Pi's contract for
@@ -9,10 +9,10 @@
  */
 
 import { Type, type Static } from "typebox";
+import { resolveBashSpec, resolvePowerShellSpec, type ShellSettings, type ShellSpec } from "./shell.ts";
 import type { ForeignTaskInfo, TaskOutput, TaskRegistry, TaskSnapshot, TaskStatus } from "./tasks.ts";
 
-const BashBgParams = Type.Object({
-	command: Type.String({ description: "Shell command to run (executed with bash -c)." }),
+const BgSharedParams = {
 	cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the session cwd." })),
 	timeout_sec: Type.Optional(
 		Type.Number({
@@ -55,6 +55,19 @@ const BashBgParams = Type.Object({
 				"Run detached from the pi process: the task survives pi quitting (machine reboots still kill it). Output goes to a machine-wide pool; a session resumed with the same session id re-subscribes automatically, any other session sees it in bg_status and can adopt it with bg_adopt. Timeout defaults to off.",
 		}),
 	),
+};
+
+const BashBgParams = Type.Object({
+	command: Type.String({ description: "Shell command to run (executed with bash -c)." }),
+	...BgSharedParams,
+});
+
+const PowershellBgParams = Type.Object({
+	command: Type.String({
+		description:
+			"PowerShell command to run (executed via pwsh/powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command).",
+	}),
+	...BgSharedParams,
 });
 
 const BgStatusParams = Type.Object({
@@ -84,6 +97,12 @@ export interface BgToolDeps {
 	registry: TaskRegistry;
 	/** Called after state changes (task started / killed) so the host can refresh UI. */
 	onChange?: () => void;
+	/** pi settings accessor: shellPath steers bash resolution, shellCommandPrefix is prepended (native parity, ADR-0009). */
+	getSettings?: () => ShellSettings & { shellCommandPrefix?: string };
+	/** Override bash resolution for tests (ADR-0009). */
+	resolveBash?: () => ShellSpec;
+	/** Override PowerShell resolution for tests (ADR-0009). */
+	resolvePowerShell?: () => ShellSpec;
 }
 
 /** Models sometimes emit "#3" or "3" for an id field; normalize before validation. */
@@ -171,8 +190,15 @@ export function bashBgTool(deps: BgToolDeps) {
 			_onUpdate: unknown,
 			_ctx: unknown,
 		) {
+			// Native parity (ADR-0009): resolve bash exactly like the built-in bash
+			// tool (shellPath setting → Git Bash → PATH) and honor its
+			// shellCommandPrefix (joined with a newline, same as native).
+			const settings = deps.getSettings?.() ?? {};
+			const spec = deps.resolveBash !== undefined ? deps.resolveBash() : resolveBashSpec(settings);
+			const prefix = settings.shellCommandPrefix?.trim();
+			const command = prefix !== undefined && prefix !== "" ? `${prefix}\n${params.command}` : params.command;
 			const snapshot = deps.registry.start({
-				command: params.command,
+				command,
 				cwd: params.cwd,
 				timeoutMs: params.timeout_sec !== undefined ? Math.max(0, params.timeout_sec) * 1000 : undefined,
 				env: params.env,
@@ -188,6 +214,7 @@ export function bashBgTool(deps: BgToolDeps) {
 				reportEveryMs:
 					params.report_every_sec !== undefined ? Math.max(5, params.report_every_sec) * 1000 : undefined,
 				detach: params.detach ?? false,
+				shell: spec,
 			});
 			deps.onChange?.();
 			const extras: string[] = [];
@@ -209,6 +236,73 @@ export function bashBgTool(deps: BgToolDeps) {
 			const text =
 				`Started background task #${snapshot.id} (pid ${snapshot.pid ?? "?"}): ${snapshot.label}\n` +
 				(extras.length > 0 ? `${extras.join("\n")}\n` : "") +
+				`A completion notification with the output arrives automatically on exit — continue working; do not poll.\n` +
+				`On-demand checks: bg_status {"id": ${snapshot.id}} for progress, bg_kill {"id": ${snapshot.id}} to stop it.`;
+			return {
+				content: [{ type: "text" as const, text }],
+				details: { id: snapshot.id, pid: snapshot.pid, command: snapshot.command, timeoutMs: snapshot.timeoutMs },
+			};
+		},
+	};
+}
+
+/**
+ * powershell_bg — the background sibling of pi's optional native powershell
+ * tool (ADR-0009). Registered on win32 only and inactive by default, exactly
+ * like the native tool: activate with defaultTools ["+powershell_bg"] (one
+ * settings line lights up both the native foreground tool and this one).
+ * Resolution mirrors native too: pwsh.exe when available, then Windows
+ * PowerShell. The agent picks the shell by picking the tool — bash_bg vs
+ * powershell_bg — never a per-call parameter.
+ */
+export function powershellBgTool(deps: BgToolDeps) {
+	return {
+		name: "powershell_bg",
+		label: "Background PowerShell",
+		defaultActive: false,
+		description:
+			"Run a PowerShell command in the background and return immediately with a task id — the background " +
+			"sibling of the powershell tool (pwsh.exe when available, then Windows PowerShell). " +
+			"Same semantics as bash_bg: a completion notification with the output tail arrives on exit — do not poll.",
+		promptSnippet:
+			"powershell_bg — run a PowerShell command in the background; output is delivered when it exits; " +
+			"prefer this over the powershell tool for commands expected to take longer than a few seconds",
+		promptGuidelines: [
+			"Use powershell_bg instead of powershell for long-running commands (builds, test suites, dev servers, watches) so the session stays responsive.",
+			"Pick the shell by picking the tool: bash_bg for bash syntax, powershell_bg for PowerShell syntax — there is no shell parameter.",
+		],
+		parameters: PowershellBgParams,
+		executionMode: "sequential" as const,
+		async execute(
+			_toolCallId: string,
+			params: Static<typeof PowershellBgParams>,
+			_signal: AbortSignal | undefined,
+			_onUpdate: unknown,
+			_ctx: unknown,
+		) {
+			const spec = deps.resolvePowerShell !== undefined ? deps.resolvePowerShell() : resolvePowerShellSpec();
+			const snapshot = deps.registry.start({
+				command: params.command,
+				cwd: params.cwd,
+				timeoutMs: params.timeout_sec !== undefined ? Math.max(0, params.timeout_sec) * 1000 : undefined,
+				env: params.env,
+				label: params.label,
+				pattern:
+					params.on_pattern !== undefined
+						? {
+								literal: params.on_pattern,
+								all: params.on_pattern_all ?? false,
+								stop: params.on_pattern_stop ?? false,
+							}
+						: undefined,
+				reportEveryMs:
+					params.report_every_sec !== undefined ? Math.max(5, params.report_every_sec) * 1000 : undefined,
+				detach: params.detach ?? false,
+				shell: spec,
+			});
+			deps.onChange?.();
+			const text =
+				`Started background task #${snapshot.id} (pwsh, pid ${snapshot.pid ?? "?"}): ${snapshot.label}\n` +
 				`A completion notification with the output arrives automatically on exit — continue working; do not poll.\n` +
 				`On-demand checks: bg_status {"id": ${snapshot.id}} for progress, bg_kill {"id": ${snapshot.id}} to stop it.`;
 			return {
