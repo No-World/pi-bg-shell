@@ -35,6 +35,7 @@ function snapshot(overrides: Partial<TaskSnapshot> = {}): TaskSnapshot {
 		id: 1,
 		label: "npm test",
 		command: "npm test",
+	shell: "bash",
 		cwd: "/repo",
 		pid: 100,
 		status: "running",

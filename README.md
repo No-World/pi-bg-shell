@@ -15,7 +15,7 @@ Notify:  Background task #1 completed (exit 0, 42.1s): npm test
 
 ## Why
 
-Pi's built-in `bash` tool blocks the whole agent turn until the command finishes. A two-minute test suite means two minutes of a frozen session. `pi-bg-shell` gives the agent three tools to fire long-running commands (builds, test suites, dev servers, watches) in the background and get **woken up** with the output the moment they exit — no polling, no babysitting.
+Pi's built-in `bash` tool blocks the whole agent turn until the command finishes. A two-minute test suite means two minutes of a frozen session. `pi-bg-shell` gives the agent a tool family to fire long-running commands (builds, test suites, dev servers, watches) in the background and get **woken up** with the output the moment they exit — no polling, no babysitting.
 
 ## Tools
 
@@ -25,6 +25,7 @@ Pi's built-in `bash` tool blocks the whole agent turn until the command finishes
 | `bg_status` | Lists all tasks with one-line summaries, or fetches one task's full status and output tails by id. The listing also carries a **Global pool** section: detached tasks owned by other sessions, visible but not adopted here. |
 | `bg_kill` | Terminates a task by id (default `SIGTERM`). Kill rights on a pool task belong to its creator or any subscriber — i.e. anyone who can see it in their own registry. |
 | `bg_adopt` | Subscribes this session to a foreign pool task by manifest path (from bg_status's Global pool section): completion notices, pattern wakes, and kill rights follow (ADR-0007). |
+| `powershell_bg` | Windows only: the `bash_bg` sibling for PowerShell — `pwsh.exe` when available, then Windows PowerShell, with the same argv prefix as pi's native `powershell` tool. Inactive by default; activate with `defaultTools: ["+powershell_bg"]` (ADR-0009). |
 
 Completion is delivered as a `bg-shell-notify` message via `pi.sendMessage({ triggerTurn: true })` — the same wake primitive the official file-trigger example and pi-subagents' completion path use. Completions inside a 100 ms window merge into a single message, so a fan-out of tasks cannot stampede the session. Default wall-clock limit is 10 minutes per task (`timeout_sec` overrides; `0` disables).
 
@@ -60,7 +61,27 @@ Notify:  Background task #1 pattern match (on_pattern "ROOTED", match #1, runnin
 
 `bg_kill` signals the detached task's whole process group.
 
-On Windows, `bash` is typically the WSL relay and inherited Windows file handles cannot cross that boundary — detached tasks there switch to shell-side redirection (`( cmd ) >> OUT 2>> ERR` with `/mnt/<drive>/…`-translated paths), so output files and exit codes still land exactly where `bg_status` and pool scans expect them. The wrapper itself ships as a host-side script file (`bash <file>`, never `-c` argv) so the recorded exit code survives the relay's argument re-quoting. On Windows the detached relay is started through a GUI-subsystem wscript launcher — `detached` + `windowsHide` alone still pops a console — so spawns are popup-free and the task even survives the hosting terminal being closed. `bg_kill` on Windows terminates the whole relay tree via `taskkill /t /f` (there are no POSIX signals across the boundary) and writes a kill-attribution marker so other subscribers' notices say who killed the task. `on_pattern` watches an owned detached task's output from byte zero — early startup milestones wake the session just like adopted ones (which replay history). The pool is a bulletin board, not private property (ADR-0007): every session sees every manifest, subscription is a per-pid marker file (exclusive-create, so concurrent sessions never race), and artifacts are collected only once a task is terminal, reported, unsubscribed, and its creating process is gone.
+### Windows shells (ADR-0009)
+
+**bash_bg** resolves bash exactly like the native `bash` tool: `shellPath` setting → Git Bash (`%ProgramFiles%\Git\bin\bash.exe`, then x86) → `bash.exe` on PATH. No bash anywhere → the same actionable error native prints (install Git for Windows / add to PATH / set `shellPath`). `shellCommandPrefix` is honored for bash tasks, like the native bash tool.
+
+**powershell_bg** is the optional sibling of pi's `powershell` tool, present only on Windows and **inactive by default** — enable it the same way as the native tool:
+
+```json
+{ "defaultTools": ["+powershell", "+powershell_bg"] }
+```
+
+One settings line lights up both the foreground and the background PowerShell tools. Resolution matches native: `pwsh.exe` first, then Windows PowerShell, always `-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command` with the UTF-8 console-output header. The agent picks the shell by picking the tool — there is no per-call `shell` parameter, and there is no `cmd_bg` (native has no cmd tool either).
+
+Detached tasks branch by interpreter flavor, all popup-free through the same GUI-subsystem wscript launcher (PITFALLS P8) and all killed via `taskkill /t /f`:
+
+| Flavor | Wrapper | Output |
+|--------|---------|--------|
+| WSL relay | `.sh` with `/mnt/<drive>/…` paths (P6: never `-c` argv) | shell-side `>>` redirection |
+| Git Bash / Cygwin / MSYS2 / custom `shellPath` | `.sh` with `C:/…` forward-slash paths | shell-side `>>` redirection |
+| PowerShell | static `.cmd` template; the command rides the `PI_BG_SHELL_CMD` env var, exit code via a trailer inside the command | cmd's raw-byte `1>>/2>>` (PowerShell 5.1's own `>>` writes UTF-16LE) |
+
+On Windows, `bash_bg` resolves bash exactly like pi's native `bash` tool (ADR-0009): the `shellPath` setting, then Git Bash under Program Files, then `bash.exe` on PATH — the WSL relay is the last resort, not the default. Detached machinery follows the resolved flavor. On the WSL relay, inherited Windows file handles cannot cross the boundary — detached tasks there switch to shell-side redirection (`( cmd ) >> OUT 2>> ERR` with `/mnt/<drive>/…`-translated paths), so output files and exit codes still land exactly where `bg_status` and pool scans expect them. The wrapper itself ships as a host-side script file (`bash <file>`, never `-c` argv) so the recorded exit code survives the relay's argument re-quoting. On Windows the detached relay is started through a GUI-subsystem wscript launcher — `detached` + `windowsHide` alone still pops a console — so spawns are popup-free and the task even survives the hosting terminal being closed. `bg_kill` on Windows terminates the whole relay tree via `taskkill /t /f` (there are no POSIX signals across the boundary) and writes a kill-attribution marker so other subscribers' notices say who killed the task. `on_pattern` watches an owned detached task's output from byte zero — early startup milestones wake the session just like adopted ones (which replay history). The pool is a bulletin board, not private property (ADR-0007): every session sees every manifest, subscription is a per-pid marker file (exclusive-create, so concurrent sessions never race), and artifacts are collected only once a task is terminal, reported, unsubscribed, and its creating process is gone.
 
 ## User surface
 

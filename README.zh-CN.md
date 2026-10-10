@@ -15,7 +15,7 @@ Agent:   （继续写 changelog、回你消息、读文件……）
 
 ## 为什么需要它
 
-Pi 内置的 `bash` 工具会阻塞整个 agent 轮次直到命令结束——两分钟的测试套件就是两分钟的会话冻结。`pi-bg-shell` 给 agent 三个工具，把长命令（构建、测试套件、dev server、文件监听）丢到后台，**命令一退出就自动唤醒** agent 并送上输出——不轮询、不蹲守。
+Pi 内置的 `bash` 工具会阻塞整个 agent 轮次直到命令结束——两分钟的测试套件就是两分钟的会话冻结。`pi-bg-shell` 给 agent 一族工具，把长命令（构建、测试套件、dev server、文件监听）丢到后台，**命令一退出就自动唤醒** agent 并送上输出——不轮询、不蹲守。
 
 ## 工具
 
@@ -25,6 +25,7 @@ Pi 内置的 `bash` 工具会阻塞整个 agent 轮次直到命令结束——�
 | `bg_status` | 列出全部任务的单行摘要，或按 id 取单个任务的完整状态与输出尾部。列表末尾附**全局池**分区：其他会话的脱离任务，可见但未认领。 |
 | `bg_kill` | 按 id 终止任务（默认 `SIGTERM`）。池任务的杀权归创建者或任一订阅者——即能在自己注册表里看到它的任何人。 |
 | `bg_adopt` | 按清单路径（来自 bg_status 全局池分区）把一个外来池任务订阅到本会话：完成通知、模式唤醒、杀权随之而来（ADR-0007）。 |
+| `powershell_bg` | 仅 Windows：`bash_bg` 的 PowerShell 兄弟工具——优先 `pwsh.exe`、回退 Windows PowerShell，argv 前缀与 pi 原生 `powershell` 工具一致。默认不激活，经 `defaultTools: ["+powershell_bg"]` 启用（ADR-0009）。 |
 
 完成通知以 `bg-shell-notify` 消息经 `pi.sendMessage({ triggerTurn: true })` 送进对话——与官方 file-trigger 示例、pi-subagents 的完成通知同一条唤醒原语。100 ms 窗口内的并发完成合并为一条消息，fan-out 不会冲垮会话。默认墙钟上限每任务 10 分钟（`timeout_sec` 可覆盖；`0` 关闭）。
 
@@ -60,7 +61,27 @@ Notify:  Background task #1 pattern match (on_pattern "ROOTED", match #1, runnin
 
 `bg_kill` 对脱离任务发整进程组信号。
 
-Windows 上 `bash` 通常是 WSL 中继，继承的 Windows 文件句柄跨不了这个边界——脱离任务在该平台改走 shell 自重定向（路径译为 `/mnt/<drive>/…`，`( cmd ) >> OUT 2>> ERR`），输出文件与退出码仍落在 `bg_status` 和下会话领养预期的位置。包装层本身以宿主侧脚本文件传递（`bash <file>`，不经 `-c` argv），退出码不会被 WSL 中继的参数重引号展开成 0。Windows 上 detached 中继改经 GUI 子系统的 wscript 启动器拉起——仅靠 `detached`+`windowsHide` 仍会弹控制台——因此启动零弹窗，且任务不再被「关闭终端窗口」连带杀死；`bg_kill` 在 Windows 上用 `taskkill /t /f` 整树终止（跨 WSL 边界没有 POSIX 信号语义），并写入杀归因标记，让其他订阅者的通知注明凶手。自有脱离任务的 `on_pattern` 从第 0 字节起监视——启动早期的 milestone 同样会唤醒会话（认领任务另有全量回放）。任务池是公告板不是私有领地（ADR-0007）：每个会话都能看到每份清单；订阅是每 pid 一个独占创建的标记文件（并发会话无竞态）；工件只在任务终态、已汇报、无活订阅、创建进程消失后才被回收。
+### Windows shell 矩阵（ADR-0009）
+
+**bash_bg** 的解析顺序镜像原生 `bash` 工具：`shellPath` 设置 → Git Bash（`%ProgramFiles%\Git\bin\bash.exe`，其次 x86）→ PATH 上的 `bash.exe`。全都没有 → 报与原生同款的可操作错误（装 Git for Windows / 加入 PATH / 设 `shellPath`）。bash 任务同样吃 `shellCommandPrefix` 设置，行为与原生一致。
+
+**powershell_bg** 是 pi 原生 `powershell` 工具的可选兄弟，仅 Windows 注册、**默认不激活**——与原生工具同一开关：
+
+```json
+{ "defaultTools": ["+powershell", "+powershell_bg"] }
+```
+
+一行配置同时点亮前台后台。解析同原生：优先 `pwsh.exe`，回退 Windows PowerShell，argv 恒为 `-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command` 并前置 UTF-8 控制台输出头。agent 按调用挑工具（bash_bg / powershell_bg）来选解释器——没有 per-call `shell` 参数，也没有 `cmd_bg`（原生同样没有 cmd 工具）。
+
+脱离任务按解释器风味分支，一律经 GUI 子系统 wscript 启动器零弹窗拉起（PITFALLS P8），一律 `taskkill /t /f` 整树终止：
+
+| 风味 | 包装层 | 输出 |
+|------|--------|------|
+| WSL 中继 | `.sh`，路径译为 `/mnt/<drive>/…`（P6：绝不走 `-c` argv） | shell 侧 `>>` 重定向 |
+| Git Bash / Cygwin / MSYS2 / 自定义 `shellPath` | `.sh`，`C:/…` 正斜杠路径 | shell 侧 `>>` 重定向 |
+| PowerShell | 静态 `.cmd` 模板；命令经 `PI_BG_SHELL_CMD` 环境变量传入，退出码由命令内 trailer 记录 | cmd 的原始字节 `1>>/2>>`（PowerShell 5.1 自己的 `>>` 写 UTF-16LE） |
+
+Windows 上 `bash_bg` 的 bash 解析与 pi 原生 `bash` 工具完全一致（ADR-0009）：`shellPath` 设置 → Program Files 下的 Git Bash → PATH 上的 `bash.exe`——WSL 中继只是最后兜底，不再是默认。脱离机制按解析出的解释器风味分支。WSL 中继上，继承的 Windows 文件句柄跨不了边界——脱离任务改走 shell 自重定向（路径译为 `/mnt/<drive>/…`，`( cmd ) >> OUT 2>> ERR`），输出文件与退出码仍落在 `bg_status` 和下会话领养预期的位置。包装层本身以宿主侧脚本文件传递（`bash <file>`，不经 `-c` argv），退出码不会被 WSL 中继的参数重引号展开成 0。Windows 上 detached 中继改经 GUI 子系统的 wscript 启动器拉起——仅靠 `detached`+`windowsHide` 仍会弹控制台——因此启动零弹窗，且任务不再被「关闭终端窗口」连带杀死；`bg_kill` 在 Windows 上用 `taskkill /t /f` 整树终止（跨 WSL 边界没有 POSIX 信号语义），并写入杀归因标记，让其他订阅者的通知注明凶手。自有脱离任务的 `on_pattern` 从第 0 字节起监视——启动早期的 milestone 同样会唤醒会话（认领任务另有全量回放）。任务池是公告板不是私有领地（ADR-0007）：每个会话都能看到每份清单；订阅是每 pid 一个独占创建的标记文件（并发会话无竞态）；工件只在任务终态、已汇报、无活订阅、创建进程消失后才被回收。
 
 ## 用户界面
 
